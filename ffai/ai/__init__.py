@@ -6,6 +6,7 @@ from .layers import *
 from .registry import *
 # from .renderer import *
 from .bots import GrodBot
+from .bots import RiskBot
 from .bots import RandomBot
 from .bots import ProcBot
 
