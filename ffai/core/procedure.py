@@ -7,6 +7,7 @@ This module contains all the procedures. Procedures contain the core part of the
 responsible for an isolated part of the game. Procedures are added to a stack, and the top-most procedure must finish
 before other procedures are run. Procedures can add other procedures to the stack simply by instantiating procedures.
 """
+from abc import abstractmethod, ABCMeta
 
 from ffai.core.model import *
 from ffai.core.table import *
@@ -205,7 +206,7 @@ class Armor(Procedure):
 
 class Block(Procedure):
 
-    def __init__(self, game, attacker, defender, blitz=False, frenzy=False, gfi=False):
+    def __init__(self, game, attacker, defender, blitz=False, frenzy_block=False, gfi=False):
         super().__init__(game)
         self.attacker = attacker
         self.defender = defender
@@ -213,7 +214,7 @@ class Block(Procedure):
         self.roll = None
         self.blitz = blitz
         self.gfi = gfi
-        self.frenzy = frenzy
+        self.frenzy_block = frenzy_block
         self.waiting_wrestle_attacker = False
         self.waiting_wrestle_defender = False
         self.selected_die = None
@@ -221,7 +222,7 @@ class Block(Procedure):
         self.favor = None
         self.dauntless_roll = None
         self.dauntless_success = False
-        self.frenzy_check = False
+        self.frenzy_checked = False
         self.waiting_gfi = False
 
     def step(self, action):
@@ -233,13 +234,16 @@ class Block(Procedure):
             return False
 
         # Frenzy check
-        if self.frenzy and not self.frenzy_check:
-            # Check if player was not pushed out of bounds
-            if self.defender.position is None:
+        if self.frenzy_block and not self.frenzy_checked:
+            # End frenzy block procedure if plays is not on the field or not standing
+            if self.defender.position is None or not self.defender.state.up:
                 return True
-            #self.game.report(Outcome(OutcomeType.FRENZY_USED, player=self.attacker, opp_player=self.defender,
-            #                         team=self.attacker.team))
-            self.frenzy_check = True
+            # If not adjacent to defender - e.g. in case of fend
+            if self.defender not in self.game.get_adjacent_opponents(self.attacker):
+                return True
+            self.game.report(Outcome(OutcomeType.SKILL_USED, player=self.attacker, skill=Skill.FRENZY))
+            self.attacker.state.used_skills.append(Skill.FRENZY)
+            self.frenzy_checked = True
 
         # Roll
         if self.roll is None:
@@ -325,7 +329,7 @@ class Block(Procedure):
             KnockDown(self.game, self.attacker, inflictor=self.defender)
             return True
 
-        if self.selected_die == BBDieResult.BOTH_DOWN:
+        elif self.selected_die == BBDieResult.BOTH_DOWN:
             if not self.attacker.has_skill(Skill.BLOCK):
                 Turnover(self.game)
                 KnockDown(self.game, self.attacker, inflictor=self.defender)
@@ -337,16 +341,16 @@ class Block(Procedure):
                 self.game.report(Outcome(OutcomeType.SKILL_USED, player=self.defender, skill=Skill.BLOCK))
             return True
 
-        if self.selected_die == BBDieResult.DEFENDER_DOWN:
+        elif self.selected_die == BBDieResult.DEFENDER_DOWN:
             Push(self.game, self.attacker, self.defender, knock_down=True, blitz=self.blitz)
             return True
 
-        if self.selected_die == BBDieResult.DEFENDER_STUMBLES:
+        elif self.selected_die == BBDieResult.DEFENDER_STUMBLES:
             Push(self.game, self.attacker, self.defender, knock_down=(not self.defender.has_skill(Skill.DODGE)) or self.attacker.has_skill(Skill.TACKLE),
                  blitz=self.blitz)
             return True
 
-        if self.selected_die == BBDieResult.PUSH:
+        elif self.selected_die == BBDieResult.PUSH:
             Push(self.game, self.attacker, self.defender, knock_down=False, blitz=self.blitz)
             return True
 
@@ -1830,6 +1834,7 @@ class EndPlayerTurn(Procedure):
         self.player.state.moves = 0
         self.game.report(Outcome(OutcomeType.END_PLAYER_TURN, player=self.player))
         self.game.state.active_player = None
+        self.player.state.squares_moved.clear()
         return True
 
     def available_actions(self):
@@ -1844,12 +1849,11 @@ class PlayerAction(Procedure):
         self.player_action_type = player_action_type
         self.blitz_block = False
         self.turn = turn
-        self.squares = []
 
     def step(self, action):
 
-        if len(self.squares) == 0:
-            self.squares.append(self.player.position)
+        if len(self.player.state.squares_moved) == 0:
+            self.player.state.squares_moved.append(self.player.position)
 
         if action.action_type == ActionType.END_PLAYER_TURN:
             EndPlayerTurn(self.game, self.player)
@@ -1860,7 +1864,7 @@ class PlayerAction(Procedure):
             StandUp(self.game, self.player, roll=self.player.get_ma() < 3)
             self.player.state.moves += min(self.player.get_ma(), 3)
             for i in range(3):
-                self.squares.append(self.player.position)
+                self.player.state.squares_moved.append(self.player.position)
 
             return False
 
@@ -1885,7 +1889,7 @@ class PlayerAction(Procedure):
 
             # Add proc
             Move(self.game, self.player, action.position, gfi, dodge)
-            self.squares.append(action.position)
+            self.player.state.squares_moved.append(action.position)
 
             self.player.state.moves += 1
 
@@ -1893,25 +1897,33 @@ class PlayerAction(Procedure):
 
         elif action.action_type == ActionType.BLOCK:
 
+            self.blitz_block = self.player_action_type == PlayerActionType.BLITZ
+
             # Check GFI
             gfi = False
+            gfi_frenzy = False
+            frenzy_allowed = True
             if self.player_action_type == PlayerActionType.BLITZ:
                 move_needed = 3 if not self.player.state.up else 1
+                gfis = 3 if self.player.has_skill(Skill.SPRINT) else 2
                 gfi = self.player.state.moves + move_needed > self.player.get_ma()
-                # Use movement
+                gfi_frenzy = self.player.state.moves + move_needed + 1 > self.player.get_ma()
+                frenzy_allowed = self.player.state.moves + move_needed + 1 < self.player.get_ma() + gfis
                 self.player.state.moves += move_needed
-                for i in range(move_needed):
-                    self.squares.append(self.player.position)
-                    self.player.state.up = True
-
-            # TODO: Check frenzy
+                if not self.player.state.up:
+                    for i in range(move_needed-1):
+                        self.player.state.squares_moved.append(self.player.position)
+                self.player.state.up = True
 
             # End turn after block - if not a blitz action
             if self.player_action_type == PlayerActionType.BLOCK:
                 EndPlayerTurn(self.game, self.player)
 
-            # Block
-            self.blitz_block = self.player_action_type == PlayerActionType.BLITZ
+            # Frenzy second block
+            if self.player.has_skill(Skill.FRENZY) and frenzy_allowed:
+                Block(self.game, self.player, player_to, blitz=self.blitz_block, gfi=gfi_frenzy, frenzy_block=True)
+
+            # Regular block
             Block(self.game, self.player, player_to, blitz=self.blitz_block, gfi=gfi)
 
             if self.player_action_type == PlayerActionType.BLOCK:
@@ -2160,25 +2172,30 @@ class PreKickOff(Procedure):
 
 class FollowUp(Procedure):
 
-    def __init__(self, game, player, pos_to):
+    def __init__(self, game, attacker, defender, pos_to):
         super().__init__(game)
-        self.player = player
+        self.attacker = attacker
+        self.defender = defender
         self.pos_to = pos_to
 
     def step(self, action):
-
-        if self.player.has_skill(Skill.FRENZY) or action.position == self.pos_to:
-            self.game.move(self.player, self.pos_to)
-            self.game.report(Outcome(OutcomeType.FOLLOW_UP, position=self.pos_to, player=self.player))
-
+        if self.defender.has_skill(Skill.FEND):
+            self.game.report(Outcome(OutcomeType.SKILL_USED, skill=Skill.FEND, player=self.defender))
+            self.attacker.state.squares_moved.append(self.attacker.position)
+        elif self.attacker.has_skill(Skill.FRENZY) or action.position == self.pos_to:
+            self.game.move(self.attacker, self.pos_to)
+            self.attacker.state.squares_moved.append(self.pos_to)
+            self.game.report(Outcome(OutcomeType.FOLLOW_UP, position=self.pos_to, player=self.attacker))
+        else:
+            self.attacker.state.squares_moved.append(self.attacker.position)
         return True
 
     def available_actions(self):
-        if self.player.has_skill(Skill.FRENZY):
+        if self.attacker.has_skill(Skill.FRENZY) or self.defender.has_skill(Skill.FEND):
             return []
         else:
-            return [ActionChoice(ActionType.FOLLOW_UP, team=self.player.team,
-                                 positions=[self.player.position, self.pos_to])]
+            return [ActionChoice(ActionType.FOLLOW_UP, team=self.attacker.team,
+                                 positions=[self.attacker.position, self.pos_to])]
 
 
 class Push(Procedure):
@@ -2197,6 +2214,7 @@ class Push(Procedure):
         self.push_to = None
         self.follow_to = None
         self.squares = None
+        self.selector = pusher
         self.crowd = False
 
     def step(self, action):
@@ -2226,39 +2244,41 @@ class Push(Procedure):
 
             # Chain push
             if not self.chain:
-                FollowUp(self.game, self.pusher, self.follow_to)
+                FollowUp(self.game, self.pusher, self.player, self.follow_to)
 
             return True
 
         # Use stand firm
-        '''
         if self.waiting_stand_firm:
             if action.action_type == ActionType.USE_STAND_FIRM:
                 return True
             else:
                 self.waiting_stand_firm = False
                 self.stand_firm_used = True
-        '''
-
-        # Get possible squares
-        if self.squares is None:
-            # Side step lets the defender choose
-            if self.player.has_skill(Skill.SIDE_STEP):
-                self.game.report(Outcome(OutcomeType.SKILL_USED, player=self.player, skill=Skill.SIDE_STEP))
-                self.squares = self.game.get_adjacent_squares(self.player.position, occupied=False)
-                if len(self.squares) > 0:
-                    if self.player.team != self.game.state.current_team:
-                        self.game.add_secondary_clock(self.player.team)
-            # If not side step or no free squares
-            if self.squares is None or len(self.squares) == 0:
-                self.squares = self.game.get_push_squares(self.pusher.position, self.player.position)
-            return False
 
         # Stand firm
         if self.player.has_skill(Skill.STAND_FIRM) and not self.stand_firm_used:
-            if not (self.blitz and self.pusher.has_skill(Skill.JUGGERNAUT)):
+            if not self.pusher.has_skill(Skill.JUGGERNAUT):
                 self.waiting_stand_firm = True
                 return False
+
+        # Get possible squares
+        if self.squares is None:
+            # Sidestep and grab cancels out eachother - otherwise let the grabber or sidestepper select adjacent square
+            if self.player.has_skill(Skill.SIDE_STEP) and not self.pusher.has_skill(Skill.GRAB):
+                self.game.report(Outcome(OutcomeType.SKILL_USED, player=self.player, skill=Skill.SIDE_STEP))
+                self.squares = self.game.get_adjacent_squares(self.player.position, occupied=False)
+                self.selector = self.player
+                if len(self.squares) > 0:
+                    if self.player.team != self.game.state.current_team:
+                        self.game.add_secondary_clock(self.player.team)
+            elif self.pusher.has_skill(Skill.GRAB) and not self.player.has_skill(Skill.SIDE_STEP):
+                self.game.report(Outcome(OutcomeType.SKILL_USED, player=self.player, skill=Skill.GRAB))
+                self.squares = self.game.get_adjacent_squares(self.player.position, occupied=False)
+            # If no free squares
+            if self.squares is None or len(self.squares) == 0:
+                self.squares = self.game.get_push_squares(self.pusher.position, self.player.position)
+            return False
 
         if action.action_type == ActionType.PUSH:
 
@@ -2296,10 +2316,10 @@ class Push(Procedure):
     def available_actions(self):
         actions = []
         if self.squares is not None:
-            if self.player.has_skill(Skill.SIDE_STEP):
-                actions.append(ActionChoice(ActionType.PUSH, team=self.player.team, positions=self.squares))
-            else:
-                actions.append(ActionChoice(ActionType.PUSH, team=self.game.state.current_team, positions=self.squares))
+            actions.append(ActionChoice(ActionType.PUSH, team=self.selector.team, positions=self.squares))
+        elif self.waiting_stand_firm:
+            actions.append(ActionChoice(ActionType.USE_SKILL, team=self.player.team))
+            actions.append(ActionChoice(ActionType.DONT_USE_SKILL, team=self.player.team))
         return actions
 
 
@@ -2739,6 +2759,10 @@ class Turn(Procedure):
         self.game.report(Outcome(outcome_type, player=player))
         if player.has_skill(Skill.BONE_HEAD):
             Bonehead(self.game, player, player_action)
+        if player.has_skill(Skill.REALLY_STUPID):
+            ReallyStupid(self.game, player, player_action)
+        if player.has_skill(Skill.WILD_ANIMAL):
+            WildAnimal(self.game, player, player_action)
 
     def step(self, action):
 
@@ -2880,7 +2904,7 @@ class WeatherTable(Procedure):
         return []
 
 
-class Bonehead(Procedure):
+class Negatrait(Procedure, metaclass=ABCMeta):
     def __init__(self, game, player, player_action):
         super().__init__(game)
         self.game = game
@@ -2891,28 +2915,49 @@ class Bonehead(Procedure):
         self.roll = None
         self.player_action = player_action
 
+        self.roll_type = None
+        self.skill = None
+        self.success_outcome = None
+        self.fail_outcome = None
+
+    @abstractmethod
+    def get_target(self):
+        pass
+
+    @abstractmethod
+    def apply_fail_state(self):
+        pass
+
+    @abstractmethod
+    def remove_fail_state(self):
+        pass
+
+    def trigger_failure(self):
+        self.apply_fail_state()
+        self.end_turn()
+
     def step(self, action):
         # If player hasn't rolled
         if not self.rolled:
             # Roll
-            self.roll = DiceRoll([D6(self.game.rnd)], roll_type=RollType.BONE_HEAD_ROLL)
-            self.roll.target = 2
+            self.roll = DiceRoll([D6(self.game.rnd)], roll_type=self.roll_type)
+            self.roll.target = self.get_target()
             self.rolled = True
 
             if self.roll.is_d6_success():
                 # Success
-                self.player.state.bone_headed = False
-                self.game.report(Outcome(OutcomeType.SUCCESSFUL_BONE_HEAD, player=self.player, rolls=[self.roll]))
+                self.remove_fail_state()
+                self.game.report(Outcome(self.success_outcome, player=self.player, rolls=[self.roll]))
                 return True
             else:
-                self.game.report(Outcome(OutcomeType.FAILED_BONE_HEAD, player=self.player, skill=Skill.BONE_HEAD, rolls=[self.roll]))
+                self.game.report(Outcome(self.fail_outcome, player=self.player, skill=self.skill, rolls=[self.roll]))
                 # Check if reroll available
                 if self.game.can_use_reroll(self.player.team):
                     self.awaiting_reroll = True
                     return False
 
                 # Player forgets what to do
-                self.trigger_bonehead()
+                self.trigger_failure()
                 return True
 
         # If reroll used
@@ -2925,11 +2970,10 @@ class Bonehead(Procedure):
                 return self.step(None)
             else:
                 # Player forgets what to do
-                self.trigger_bonehead()
+                self.trigger_failure()
                 return True
 
-    def trigger_bonehead(self):
-        self.player.state.bone_headed = True
+    def end_turn(self):
         # mark player turn as over
         EndPlayerTurn(self.game, self.player)
         # don't let the intended action happen
@@ -2941,3 +2985,66 @@ class Bonehead(Procedure):
                     ActionChoice(ActionType.DONT_USE_REROLL, team=self.game.state.current_team)]
 
         return []
+
+
+class Bonehead(Negatrait):
+    def __init__(self, game, player, player_action):
+        super().__init__(game, player, player_action)
+        self.roll_type = RollType.BONE_HEAD_ROLL
+        self.skill = Skill.BONE_HEAD
+        self.success_outcome = OutcomeType.SUCCESSFUL_BONE_HEAD
+        self.fail_outcome = OutcomeType.FAILED_BONE_HEAD
+
+    def get_target(self):
+        return 2
+
+    def apply_fail_state(self):
+        self.player.state.bone_headed = True
+
+    def remove_fail_state(self):
+        self.player.state.bone_headed = False
+
+
+class ReallyStupid(Negatrait):
+    def __init__(self, game, player, player_action):
+        super().__init__(game, player, player_action)
+        self.roll_type = RollType.REALLY_STUPID_ROLL
+        self.skill = Skill.REALLY_STUPID
+        self.success_outcome = OutcomeType.SUCCESSFUL_REALLY_STUPID
+        self.fail_outcome = OutcomeType.FAILED_REALLY_STUPID
+
+    def get_target(self):
+        target = 4  # default target for player alone
+        team_mates = self.game.get_adjacent_teammates(self.player)
+        if team_mates:
+            for team_mate in team_mates:
+                if not team_mate.has_skill(Skill.REALLY_STUPID):
+                    target = 2  # a non-stupid neighbour improves the odds
+        return target
+
+    def apply_fail_state(self):
+        self.player.state.really_stupid = True
+
+    def remove_fail_state(self):
+        self.player.state.really_stupid = False
+
+
+class WildAnimal(Negatrait):
+    def __init__(self, game, player, player_action):
+        super().__init__(game, player, player_action)
+        self.roll_type = RollType.WILD_ANIMAL_ROLL
+        self.skill = Skill.WILD_ANIMAL
+        self.success_outcome = OutcomeType.SUCCESSFUL_WILD_ANIMAL
+        self.fail_outcome = OutcomeType.FAILED_WILD_ANIMAL
+
+    def get_target(self):
+        target = 4
+        if self.player_action.player_action_type is PlayerActionType.BLITZ or self.player_action.player_action_type is PlayerActionType.BLOCK:
+            target = 2
+        return target
+
+    def apply_fail_state(self):
+        self.player.state.wild_animal = True
+
+    def remove_fail_state(self):
+        self.player.state.wild_animal = False
