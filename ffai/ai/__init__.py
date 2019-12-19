@@ -7,6 +7,7 @@ from .registry import *
 # from .renderer import *
 from .bots import GrodBot
 from .bots import RiskBot
+from .bots import SearchBot
 from .bots import RandomBot
 from .bots import ProcBot
 

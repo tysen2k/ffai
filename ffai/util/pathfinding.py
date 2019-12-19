@@ -537,7 +537,7 @@ class FfTileMap(implements(TileMap)):
         agility = moving_unit.get_ag()
 
         cost = 0.0
-        num_zones_from = self.game.num_tackle_zones_in(mover.unit)
+        num_zones_from = self.game.num_tackle_zones_at(mover.unit, square_from)
         tacklers = self.game.get_adjacent_opponents(mover.unit, skill=Skill.TACKLE)
         diving_tacklers = self.game.get_adjacent_opponents(mover.unit, skill=Skill.DIVING_TACKLE)
         prehensile_tailers = self.game.get_adjacent_opponents(mover.unit, skill=Skill.TENTACLES)

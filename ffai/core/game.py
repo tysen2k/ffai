@@ -37,6 +37,7 @@ class Game:
         self.forced_action = None
 
         self.action = None
+        self.stop = False   # for game tree search functions
 
     def to_json(self):
         return {
@@ -143,6 +144,8 @@ class Game:
                 self.last_request_time = time.time()
                 self.action = self._safe_act()
                 # self.action = self._safe_act()
+                if self.stop:
+                    return
                 
                 # Check if time limit was violated
                 self.last_action_time = time.time()

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+from copy import deepcopy
+from enum import Enum
 from typing import Optional, List, Dict, Tuple
 from ffai.core import Agent, Game, Team, ActionType
 from ffai.core.procedure import *
@@ -7,17 +9,18 @@ from ffai.core.load import *
 import ffai.util.bothelper as helper
 import ffai.util.pathfinding as pf
 from ffai.ai.registry import register_bot, make_bot
-from ffai.util import ActionSequence, FfHeatMap
+from ffai.util import ActionSequence
+import numpy as np
+import math
 # from operator import itemgetter
 
+class SearchState(Enum):
+    SELECT_PLAYER = 0
 
-class RiskBot(Agent):
+
+class SearchBot(Agent):
     """
-    A Bot that uses path finding to evaluate all possibilities.
-
-    WIP!!! Hand-offs and Pass actions going a bit funny.
-
-    Modified from GrodBot with changes to turnover risk
+    A Bot that uses MCTS without rollouts to search through possible plays
 
     """
 
@@ -34,23 +37,30 @@ class RiskBot(Agent):
     BASE_SCORE_MOVE_TOWARD_BALL = 45.0
     BASE_SCORE_MOVE_TO_SWEEP = 0.0
     BASE_SCORE_CAGE_BALL = 70.0
-    BASE_SCORE_MOVE_TO_BALL = 65.0
+    BASE_SCORE_MOVE_TO_BALL = 60.0
     BASE_SCORE_BALL_AND_CHAIN = 75.0
-    BASE_SCORE_DEFENSIVE_SCREEN = -10.0
+    BASE_SCORE_DEFENSIVE_SCREEN = 0.0
     ADDITIONAL_SCORE_DODGE = 0.0  # Lower this value to dodge more.
     ADDITIONAL_SCORE_NEAR_SIDELINE = -20.0
     ADDITIONAL_SCORE_SIDELINE = -40.0
-    BASE_SCORE_TURNOVER = -100
-    BASE_SCORE_TURNOVER_UNMOVED_PLAYER = -20
 
     def __init__(self, name, verbose=True):
         super().__init__(name)
         self.my_team = None
         self.opp_team = None
         self.current_move: Optional[ActionSequence] = None
-        self.verbose = False # verbose
-        self.heat_map: Optional[FfHeatMap] = None
+        self.verbose = verbose
         self.actions_available = []
+        self.startNewSearch = True
+        self.createdNewNode = False
+        self.alreadyScored = False
+        self.tree = None
+        self.currNode = None
+        self.search_state = None
+        self.current_score = 0.0
+        self.exploreC = 0.4
+        self.maxIterations = 10
+        self.nextNodeId = 0
 
     def act(self, game):
 
@@ -68,12 +78,36 @@ class RiskBot(Agent):
         proc = game.state.stack.peek()
 
         # Call private function
-        if isinstance(proc, CoinTossFlip):
-            return self.coin_toss_flip(game)
+        if isinstance(proc, Turn):
+            return self.turn(game)
+        if isinstance(proc, PlayerAction):
+            return self.player_action(game)
+        if isinstance(proc, GFI):
+            return self.gfi(game)
+        if isinstance(proc, Dodge):
+            return self.dodge(game)
+        if isinstance(proc, Block):
+            return self.block(game)
+        if isinstance(proc, Push):
+            return self.push(game)
+        if isinstance(proc, FollowUp):
+            return self.follow_up(game)
+        if isinstance(proc, Turn) and proc.blitz:
+            return self.blitz(game)
+        if isinstance(proc, PassAction):
+            return self.pass_action(game)
+        if isinstance(proc, Catch):
+            return self.catch(game)
+        if isinstance(proc, Interception):
+            return self.interception(game)
+        if isinstance(proc, Pickup):
+            return self.pickup(game)
         if isinstance(proc, CoinTossKickReceive):
             return self.coin_toss_kick_receive(game)
         if isinstance(proc, Setup):
             return self.setup(game)
+        if isinstance(proc, CoinTossFlip):
+            return self.coin_toss_flip(game)
         if isinstance(proc, PlaceBall):
             return self.place_ball(game)
         if isinstance(proc, HighKick):
@@ -82,32 +116,8 @@ class RiskBot(Agent):
             return self.touchback(game)
         if isinstance(proc, Turn) and proc.quick_snap:
             return self.quick_snap(game)
-        if isinstance(proc, Turn) and proc.blitz:
-            return self.blitz(game)
-        if isinstance(proc, Turn):
-            return self.turn(game)
-        if isinstance(proc, PlayerAction):
-            return self.player_action(game)
-        if isinstance(proc, Block):
-            return self.block(game)
-        if isinstance(proc, Push):
-            return self.push(game)
-        if isinstance(proc, FollowUp):
-            return self.follow_up(game)
         if isinstance(proc, Apothecary):
             return self.apothecary(game)
-        if isinstance(proc, PassAction):
-            return self.pass_action(game)
-        if isinstance(proc, Catch):
-            return self.catch(game)
-        if isinstance(proc, Interception):
-            return self.interception(game)
-        if isinstance(proc, GFI):
-            return self.gfi(game)
-        if isinstance(proc, Dodge):
-            return self.dodge(game)
-        if isinstance(proc, Pickup):
-            return self.pickup(game)
 
         raise Exception("Unknown procedure")
 
@@ -173,7 +183,7 @@ class RiskBot(Agent):
                 players_available = players_sorted_value[:n_keep]
 
                 # Are we kicking or receiving?
-                if game.state.receiving_this_drive == self.my_team:
+                if game.state.receiving_this_drive:
                     place_squares: List[Square] = [
                         game.get_square(helper.reverse_x_for_right(game, self.my_team, 13), 7),
                         game.get_square(helper.reverse_x_for_right(game, self.my_team, 13), 8),
@@ -202,15 +212,15 @@ class RiskBot(Agent):
                         game.get_square(helper.reverse_x_for_right(game, self.my_team, 13), 8),
                         game.get_square(helper.reverse_x_for_right(game, self.my_team, 13), 9),
 
-                        game.get_square(helper.reverse_x_for_right(game, self.my_team, 11), 3),
-                        game.get_square(helper.reverse_x_for_right(game, self.my_team, 11), 13),
-                        game.get_square(helper.reverse_x_for_right(game, self.my_team, 10), 2),
-                        game.get_square(helper.reverse_x_for_right(game, self.my_team, 10), 14),
+                        game.get_square(helper.reverse_x_for_right(game, self.my_team, 12), 3),
+                        game.get_square(helper.reverse_x_for_right(game, self.my_team, 12), 13),
+                        game.get_square(helper.reverse_x_for_right(game, self.my_team, 11), 2),
+                        game.get_square(helper.reverse_x_for_right(game, self.my_team, 11), 14),
 
-                        game.get_square(helper.reverse_x_for_right(game, self.my_team, 11), 6),
-                        game.get_square(helper.reverse_x_for_right(game, self.my_team, 11), 10),
-                        game.get_square(helper.reverse_x_for_right(game, self.my_team, 10), 11),
-                        game.get_square(helper.reverse_x_for_right(game, self.my_team, 10), 5)
+                        game.get_square(helper.reverse_x_for_right(game, self.my_team, 12), 5),
+                        game.get_square(helper.reverse_x_for_right(game, self.my_team, 12), 10),
+                        game.get_square(helper.reverse_x_for_right(game, self.my_team, 11), 11),
+                        game.get_square(helper.reverse_x_for_right(game, self.my_team, 11), 5)
                         ]
 
                     players_sorted_bash = sorted(players_available, key=lambda x: player_bash_ability(game, x), reverse=True)
@@ -243,11 +253,11 @@ class RiskBot(Agent):
         """
         ball_pos = game.get_ball_position()
         if game.is_team_side(game.get_ball_position(), self.my_team) and game.get_player_at(game.get_ball_position()) is None:
-            players_available = game.get_players_on_pitch(self.my_team, up=True)
+            players_available = game.state.available_actions[0].players   #only non-tackle zone
             if players_available:
                 players_sorted = sorted(players_available, key=lambda x: player_blitz_ability(game, x), reverse=True)
                 player = players_sorted[0]
-                return Action(ActionType.PLACE_PLAYER, player=player, position=ball_pos)
+                return Action(ActionType.SELECT_PLAYER, player=player)
         return Action(ActionType.SELECT_NONE)
 
     def touchback(self, game: Game):
@@ -271,16 +281,12 @@ class RiskBot(Agent):
         players_moved: List[Player] = helper.get_players(game, self.my_team, include_own=True, include_opp=False, include_used=True, only_used=False)
 
         players_to_move: List[Player] = helper.get_players(game, self.my_team, include_own=True, include_opp=False, include_used=False)
-        num_unmoved = len(players_to_move)
         paths_own: Dict[Player, List[pf.Path]] = dict()
         ff_map = pf.FfTileMap(game)
         for player in players_to_move:
             player_mover = pf.FfMover(player)
             finder = pf.AStarPathFinder(ff_map, player.num_moves_left(), allow_diag_movement=True, heuristic=pf.BruteForceHeuristic(), probability_costs=True)
             paths = finder.find_paths(player_mover, player.position.x, player.position.y)
-    #        if not player.has_tackle_zone():   # either down / hypnotized / stupid
-    #            stay_put = pf.Path([], 0)
-    #            paths.insert(0, stay_put)
             paths_own[player] = paths
 
         players_opponent: List[Player] = helper.get_players(game, self.my_team, include_own=False, include_opp=True, include_stunned=False)
@@ -289,17 +295,7 @@ class RiskBot(Agent):
             player_mover = pf.FfMover(player)
             finder = pf.AStarPathFinder(ff_map, player.num_moves_left(), allow_diag_movement=True, heuristic=pf.BruteForceHeuristic(), probability_costs=True)
             paths = finder.find_paths(player_mover, player.position.x, player.position.y)
-    #        if not player.has_tackle_zone():   # either down / hypnotized / stupid
-    #            stay_put = pf.Path([], 0)
-    #            paths.insert(0, stay_put)
             paths_opposition[player] = paths
-
-        # Create a heat-map of control zones
-        heat_map: helper.FfHeatMap = helper.FfHeatMap(game, self.my_team)
-        heat_map.add_unit_by_paths(game, paths_opposition)
-        heat_map.add_unit_by_paths(game, paths_own)
-        heat_map.add_players_moved(game, helper.get_players(game, self.my_team, include_own=True, include_opp=False, only_used=True))
-        self.heat_map = heat_map
 
         all_actions: List[ActionSequence] = []
         for action_choice in game.state.available_actions:
@@ -307,37 +303,37 @@ class RiskBot(Agent):
                 players_available: List[Player] = action_choice.players
                 for player in players_available:
                     paths = paths_own[player]
-                    all_actions.extend(potential_move_actions(game, heat_map, player, paths, num_unmoved))
+                    all_actions.extend(potential_move_actions(game, player, paths))
             elif action_choice.action_type == ActionType.START_BLITZ:
                 players_available: List[Player] = action_choice.players
                 for player in players_available:
                     player_mover = pf.FfMover(player)
                     finder = pf.AStarPathFinder(ff_map, player.num_moves_left() - 1, allow_diag_movement=True, heuristic=pf.BruteForceHeuristic(), probability_costs=True)
                     paths = finder.find_paths(player_mover, player.position.x, player.position.y)
-                    all_actions.extend(potential_blitz_actions(game, heat_map, player, paths, num_unmoved))
+                    all_actions.extend(potential_blitz_actions(game, player, paths))
             elif action_choice.action_type == ActionType.START_FOUL:
                 players_available: List[Player] = action_choice.players
                 for player in players_available:
                     paths = paths_own[player]
-                    all_actions.extend(potential_foul_actions(game, heat_map, player, paths, num_unmoved))
+                    all_actions.extend(potential_foul_actions(game, player, paths))
             elif action_choice.action_type == ActionType.START_BLOCK:
                 players_available: List[Player] = action_choice.players
                 for player in players_available:
-                    all_actions.extend(potential_block_actions(game, heat_map, player))
+                    all_actions.extend(potential_block_actions(game, player))
             elif action_choice.action_type == ActionType.START_PASS:
                 players_available: List[Player] = action_choice.players
                 for player in players_available:
                     player_square: Square = player.position
                     if game.get_ball_position() == player_square:
                         paths = paths_own[player]
-                        all_actions.extend(potential_pass_actions(game, heat_map, player, paths, num_unmoved))
+                        all_actions.extend(potential_pass_actions(game, player, paths))
             elif action_choice.action_type == ActionType.START_HANDOFF:
                 players_available: List[Player] = action_choice.players
                 for player in players_available:
                     player_square: Square = player.position
                     if game.get_ball_position() == player_square:
                         paths = paths_own[player]
-                        all_actions.extend(potential_handoff_actions(game, heat_map, player, paths, num_unmoved))
+                        all_actions.extend(potential_handoff_actions(game, player, paths))
             elif action_choice.action_type == ActionType.END_TURN:
                 all_actions.extend(potential_end_turn_action(game))
 
@@ -348,7 +344,7 @@ class RiskBot(Agent):
             if self.verbose:
                 print('   Turn=H' + str(game.state.half) + 'R' + str(game.state.round) + ', Team=' + game.state.current_team.name + ', Action=' + self.current_move.description + ', Score=' + str(self.current_move.score))
 
-    def set_continuation_move(self, game: Game, num_unmoved):
+    def set_continuation_move(self, game: Game):
         """ Set self.current_move
 
         :param game:
@@ -366,9 +362,9 @@ class RiskBot(Agent):
         for action_choice in game.state.available_actions:
             if action_choice.action_type == ActionType.MOVE:
                 players_available: List[Player] = action_choice.players
-                all_actions.extend(potential_move_actions(game, self.heat_map, player, paths, num_unmoved, is_continuation=True))
+                all_actions.extend(potential_move_actions(game, player, paths, is_continuation=True))
             elif action_choice.action_type == ActionType.END_PLAYER_TURN:
-                all_actions.extend(potential_end_player_turn_action(game, self.heat_map, player))
+                all_actions.extend(potential_end_player_turn_action(game, player))
 
         if all_actions:
             all_actions.sort(key=lambda x: x.score, reverse=True)
@@ -389,7 +385,11 @@ class RiskBot(Agent):
         #   The player/play with the highest score is the one the Bot will attempt to use.
         #   Store a representation of this turn internally (for use by player-action) and return the action to begin.
 
-        self.set_next_move(game)
+        self.search_state = SearchState.SELECT_PLAYER
+        MCTSearch(self, game, self.my_team)
+        self.search_state = None
+        if self.current_move == None:
+            return None # signals stop
         next_action: Action = self.current_move.popleft()
         return next_action
 
@@ -408,8 +408,7 @@ class RiskBot(Agent):
         Take the next action from the current stack and execute
         """
         if self.current_move.is_empty():
-            num_unmoved = len(helper.get_players(game, self.my_team, include_own=True, include_opp=False, include_used=False))
-            self.set_continuation_move(game, num_unmoved)
+            self.set_continuation_move(game)
 
         action_step = self.current_move.popleft()
         return action_step
@@ -508,31 +507,22 @@ class RiskBot(Agent):
         """
         Reroll or not.
         """
-        num_unmoved = len(helper.get_players(game, self.my_team, include_own=True, include_opp=False, include_used=False))
-        if num_unmoved > 10.0 - (10.0 * self.my_team.state.rerolls) / (9 - game.state.round):
-            return Action(ActionType.USE_REROLL)
-        else:
-            return Action(ActionType.DONT_USE_REROLL)
+        return Action(ActionType.USE_REROLL)
+        # return Action(ActionType.DONT_USE_REROLL)
 
     def dodge(self, game: Game):
         """
         Reroll or not.
         """
-        num_unmoved = len(helper.get_players(game, self.my_team, include_own=True, include_opp=False, include_used=False))
-        if num_unmoved > 10.0 - (10.0 * self.my_team.state.rerolls) / (9 - game.state.round):
-            return Action(ActionType.USE_REROLL)
-        else:
-            return Action(ActionType.DONT_USE_REROLL)
+        return Action(ActionType.USE_REROLL)
+        # return Action(ActionType.DONT_USE_REROLL)
 
     def pickup(self, game: Game):
         """
         Reroll or not.
         """
-        num_unmoved = len(helper.get_players(game, self.my_team, include_own=True, include_opp=False, include_used=False))
-        if num_unmoved > 12.0 - (10.0 * self.my_team.state.rerolls) / (9 - game.state.round):
-            return Action(ActionType.USE_REROLL)
-        else:
-            return Action(ActionType.DONT_USE_REROLL)
+        return Action(ActionType.USE_REROLL)
+        # return Action(ActionType.DONT_USE_REROLL)
 
     def end_game(self, game: Game):
         """
@@ -540,10 +530,10 @@ class RiskBot(Agent):
         """
         print("Num steps:", len(self.actions_available))
         print("Avg. branching factor:", np.mean(self.actions_available))
-        RiskBot.steps.append(len(self.actions_available))
-        RiskBot.mean_actions_available.append(np.mean(self.actions_available))
-        print("Avg. Num steps:", np.mean(RiskBot.steps))
-        print("Avg. overall branching factor:", np.mean(RiskBot.mean_actions_available))
+        SearchBot.steps.append(len(self.actions_available))
+        SearchBot.mean_actions_available.append(np.mean(self.actions_available))
+        print("Avg. Num steps:", np.mean(SearchBot.steps))
+        print("Avg. overall branching factor:", np.mean(SearchBot.mean_actions_available))
         winner = game.get_winner()
         print("Casualties: ", game.num_casualties())
         print("Score: " + self.my_team.name + "->" + str(self.my_team.state.score) + " ... " + self.opp_team.name + "->" + str(self.opp_team.state.score))
@@ -590,7 +580,7 @@ def block_favourability(block_result: ActionType, team: Team, active_player: Pla
     return 0.0
 
 
-def potential_end_player_turn_action(game: Game, heat_map, player: Player) -> List[ActionSequence]:
+def potential_end_player_turn_action(game: Game, player: Player) -> List[ActionSequence]:
     actions: List[ActionSequence] = []
     action_steps: List[Action] = [
         Action(ActionType.END_PLAYER_TURN, player=player)
@@ -610,7 +600,7 @@ def potential_end_turn_action(game: Game) -> List[ActionSequence]:
     return actions
 
 
-def potential_block_actions(game: Game, heat_map: helper.FfHeatMap, player: Player) -> List[ActionSequence]:
+def potential_block_actions(game: Game, player: Player) -> List[ActionSequence]:
 
     # Note to self: need a "stand up and end move option.
     move_actions: List[ActionSequence] = []
@@ -625,7 +615,7 @@ def potential_block_actions(game: Game, heat_map: helper.FfHeatMap, player: Play
             Action(ActionType.END_PLAYER_TURN, player=player)
         ]
 
-        action_score = score_block(game, heat_map, player, blockable_player)
+        action_score = score_block(game, player, blockable_player)
         score = action_score
 
         move_actions.append(ActionSequence(action_steps, score=score, description='Block ' + player.name + ' to (' + str(blockable_player.position.x) + ',' + str(blockable_player.position.y) + ')'))
@@ -633,7 +623,7 @@ def potential_block_actions(game: Game, heat_map: helper.FfHeatMap, player: Play
     return move_actions
 
 
-def potential_blitz_actions(game: Game, heat_map: helper.FfHeatMap, player: Player, paths: List[pf.Path], num_unmoved) -> List[ActionSequence]:
+def potential_blitz_actions(game: Game, player: Player, paths: List[pf.Path]) -> List[ActionSequence]:
     move_actions: List[ActionSequence] = []
     for path in paths:
         path_steps = path.steps
@@ -650,8 +640,8 @@ def potential_blitz_actions(game: Game, heat_map: helper.FfHeatMap, player: Play
             action_steps.append(Action(ActionType.BLOCK, position=blockable_player.position, player=player))
             # action_steps.append(Action(ActionType.END_PLAYER_TURN, player=player))
 
-            action_score = score_blitz(game, heat_map, player, end_square, blockable_player)
-            path_score = path_cost_to_score(path, num_unmoved)  # If an extra GFI required for block, should increase here.  To do.
+            action_score = score_blitz(game, player, end_square, blockable_player)
+            path_score = path_cost_to_score(path)  # If an extra GFI required for block, should increase here.  To do.
             score = action_score + path_score
 
             move_actions.append(ActionSequence(action_steps, score=score, description='Blitz ' + player.name + ' to ' + str(blockable_player.position.x) + ',' + str(blockable_player.position.y)))
@@ -659,7 +649,7 @@ def potential_blitz_actions(game: Game, heat_map: helper.FfHeatMap, player: Play
     return move_actions
 
 
-def potential_pass_actions(game: Game, heat_map: helper.FfHeatMap, player: Player, paths: List[pf.Path], num_unmoved) -> List[ActionSequence]:
+def potential_pass_actions(game: Game, player: Player, paths: List[pf.Path]) -> List[ActionSequence]:
     move_actions: List[ActionSequence] = []
     for path in paths:
         path_steps = path.steps
@@ -680,8 +670,8 @@ def potential_pass_actions(game: Game, heat_map: helper.FfHeatMap, player: Playe
             action_steps.append(Action(ActionType.PASS, position=to_square, player=player))
             action_steps.append(Action(ActionType.END_PLAYER_TURN, player=player))
 
-            action_score = score_pass(game, heat_map, player, end_square, to_square)
-            path_score = path_cost_to_score(path, num_unmoved)  # If an extra GFI required for block, should increase here.  To do.
+            action_score = score_pass(game, player, end_square, to_square)
+            path_score = path_cost_to_score(path)  # If an extra GFI required for block, should increase here.  To do.
             score = action_score + path_score
 
             move_actions.append(ActionSequence(action_steps, score=score, description='Pass ' + player.name + ' to ' + str(to_square.x) + ',' + str(to_square.y)))
@@ -689,7 +679,7 @@ def potential_pass_actions(game: Game, heat_map: helper.FfHeatMap, player: Playe
     return move_actions
 
 
-def potential_handoff_actions(game: Game, heat_map: helper.FfHeatMap, player: Player, paths: List[pf.Path], num_unmoved) -> List[ActionSequence]:
+def potential_handoff_actions(game: Game, player: Player, paths: List[pf.Path]) -> List[ActionSequence]:
     move_actions: List[ActionSequence] = []
     for path in paths:
         path_steps = path.steps
@@ -704,8 +694,8 @@ def potential_handoff_actions(game: Game, heat_map: helper.FfHeatMap, player: Pl
             action_steps.append(Action(ActionType.HANDOFF, position=handoffable_player.position, player=player))
             action_steps.append(Action(ActionType.END_PLAYER_TURN, player=player))
 
-            action_score = score_handoff(game, heat_map, player, game.get_player_at(handoffable_player.position), end_square)
-            path_score = path_cost_to_score(path, num_unmoved) # If an extra GFI required for block, should increase here.  To do.
+            action_score = score_handoff(game, player, game.get_player_at(handoffable_player.position), end_square)
+            path_score = path_cost_to_score(path) # If an extra GFI required for block, should increase here.  To do.
             score = action_score + path_score
 
             move_actions.append(ActionSequence(action_steps, score=score, description='Handoff ' + player.name + ' to ' + str(handoffable_player.position.x) + ',' + str(handoffable_player.position.y)))
@@ -713,7 +703,7 @@ def potential_handoff_actions(game: Game, heat_map: helper.FfHeatMap, player: Pl
     return move_actions
 
 
-def potential_foul_actions(game: Game, heat_map: helper.FfHeatMap, player: Player, paths: List[pf.Path], num_unmoved) -> List[ActionSequence]:
+def potential_foul_actions(game: Game, player: Player, paths: List[pf.Path]) -> List[ActionSequence]:
     move_actions: List[ActionSequence] = []
     for path in paths:
         path_steps = path.steps
@@ -730,8 +720,8 @@ def potential_foul_actions(game: Game, heat_map: helper.FfHeatMap, player: Playe
             action_steps.append(Action(ActionType.FOUL, foulable_player.position, player=player))
             action_steps.append(Action(ActionType.END_PLAYER_TURN, player=player))
 
-            action_score = score_foul(game, heat_map, player, foulable_player, end_square)
-            path_score = path_cost_to_score(path, num_unmoved) # If an extra GFI required for block, should increase here.  To do.
+            action_score = score_foul(game, player, foulable_player, end_square)
+            path_score = path_cost_to_score(path) # If an extra GFI required for block, should increase here.  To do.
             score = action_score + path_score
 
             move_actions.append(ActionSequence(action_steps, score=score, description='Foul ' + player.name + ' to ' + str(foulable_player.position.x) + ',' + str(foulable_player.position.y)))
@@ -739,7 +729,7 @@ def potential_foul_actions(game: Game, heat_map: helper.FfHeatMap, player: Playe
     return move_actions
 
 
-def potential_move_actions(game: Game, heat_map: helper.FfHeatMap, player: Player, paths: List[pf.Path], num_unmoved, is_continuation: bool=False) -> List[ActionSequence]:
+def potential_move_actions(game: Game, player: Player, paths: List[pf.Path], is_continuation: bool=False) -> List[ActionSequence]:
 
     move_actions: List[ActionSequence] = []
     ball_square: Square = game.get_ball_position()
@@ -754,15 +744,12 @@ def potential_move_actions(game: Game, heat_map: helper.FfHeatMap, player: Playe
             # Note we need to add 1 to x and y because the outermost layer of squares is not actually reachable
             action_steps.append(Action(ActionType.MOVE, position=game.get_square(step.x, step.y), player=player))
 
-        if len(path_steps) == 0:
-            to_square: Square = player.position
-        else:
-            to_square: Square = game.get_square(path_steps[-1].x, path_steps[-1].y)
-        action_score, is_complete, description = score_move(game, heat_map, player, to_square)
+        to_square: Square = game.get_square(path_steps[-1].x, path_steps[-1].y)
+        action_score, is_complete, description = score_move(game, player, to_square)
         if is_complete:
             action_steps.append(Action(ActionType.END_PLAYER_TURN, player=player))
 
-        path_score = path_cost_to_score(path, num_unmoved)  # If an extra GFI required for block, should increase here.  To do.
+        path_score = path_cost_to_score(path)  # If an extra GFI required for block, should increase here.  To do.
         if is_continuation and path_score > 0:
             # Continuing actions (after a Blitz block for example) may choose risky options, so penalise
             path_score = -10 + path_score * 2
@@ -773,8 +760,8 @@ def potential_move_actions(game: Game, heat_map: helper.FfHeatMap, player: Playe
     return move_actions
 
 
-def score_blitz(game: Game, heat_map: helper.FfHeatMap, attacker: Player, block_from_square: Square, defender: Player) -> float:
-    score: float = RiskBot.BASE_SCORE_BLITZ
+def score_blitz(game: Game, attacker: Player, block_from_square: Square, defender: Player) -> float:
+    score: float = SearchBot.BASE_SCORE_BLITZ
     num_block_dice: int = game.num_block_dice_at(attacker, defender, block_from_square, blitz=True, dauntless_success=False)
     ball_position: Player = game.get_ball_position()
     if num_block_dice == 3: score += 30.0
@@ -791,23 +778,16 @@ def score_blitz(game: Game, heat_map: helper.FfHeatMap, attacker: Player, block_
         else:
             score += -40.0
     if defender.position == ball_position: score += 50.0              # Blitzing ball carrier
-    if defender.position.is_adjacent(ball_position): score += 30.0    # Blitzing someone adjacent to ball carrier
+    if defender.position.is_adjacent(ball_position): score += 20.0    # Blitzing someone adjacent to ball carrier
     if helper.direct_surf_squares(game, block_from_square, defender.position): score += 25.0  # A surf
     score -= len(game.get_adjacent_players(defender.position, team=game.get_opp_team(attacker.team))) * 5.0
     if attacker.position == block_from_square: score -= 20.0      # A Blitz where the block is the starting square is unattractive
     if helper.in_scoring_range(game, defender): score += 10.0       # Blitzing players closer to the endzone is attractive
-    score += 16.0 - 2 * defender.get_av()
-    score += defender.role.cost / 5000
-    score -= 10.0 + attacker.role.cost / 10000
-
-    # encourage standing up
-    if not attacker.has_tackle_zone(): score += 30
-
     return score
 
 
-def score_foul(game: Game, heat_map: helper.FfHeatMap, attacker: Player, defender: Player, to_square: Square) -> float:
-    score = RiskBot.BASE_SCORE_FOUL
+def score_foul(game: Game, attacker: Player, defender: Player, to_square: Square) -> float:
+    score = SearchBot.BASE_SCORE_FOUL
     ball_carrier: Optional[Player] = game.get_ball_carrier()
 
     if ball_carrier == attacker: score = score - 30.0
@@ -827,34 +807,31 @@ def score_foul(game: Game, heat_map: helper.FfHeatMap, attacker: Player, defende
     return score
 
 
-def score_move(game: Game, heat_map: helper.FfHeatMap, player: Player, to_square: Square) -> (float, bool, str):
+def score_move(game: Game, player: Player, to_square: Square) -> (float, bool, str):
 
     scores: List[(float, bool, str)] = [
-        [*score_receiving_position(game, heat_map, player, to_square), 'move to receiver'],
-        [*score_move_towards_ball(game, heat_map, player, to_square), 'move toward ball'],
-        [*score_move_to_ball(game, heat_map, player, to_square), 'move to ball'],
-        [*score_move_ball(game, heat_map, player, to_square), 'move ball'],
-        [*score_sweep(game, heat_map, player, to_square), 'move to sweep'],
-        [*score_defensive_screen(game, heat_map, player, to_square), 'move to defensive screen'],
-        [*score_offensive_screen(game, heat_map, player, to_square), 'move to offsensive screen'],
-        [*score_caging(game, heat_map, player, to_square), 'move to cage'],
-        [*score_mark_opponent(game, heat_map, player, to_square), 'move to mark opponent']
+        [*score_receiving_position(game, player, to_square), 'move to receiver'],
+        [*score_move_towards_ball(game, player, to_square), 'move toward ball'],
+        [*score_move_to_ball(game, player, to_square), 'move to ball'],
+        [*score_move_ball(game, player, to_square), 'move ball'],
+        [*score_sweep(game, player, to_square), 'move to sweep'],
+        [*score_defensive_screen(game, player, to_square), 'move to defensive screen'],
+        [*score_offensive_screen(game, player, to_square), 'move to offsensive screen'],
+        [*score_caging(game, player, to_square), 'move to cage'],
+        [*score_mark_opponent(game, player, to_square), 'move to mark opponent']
         ]
 
     scores.sort(key=lambda tup: tup[0], reverse=True)
     score, is_complete, description = scores[0]
 
     # All moves should avoid the sideline
-    if helper.distance_to_sideline(game, to_square) == 0: score += RiskBot.ADDITIONAL_SCORE_SIDELINE
-    if helper.distance_to_sideline(game, to_square) == 1: score += RiskBot.ADDITIONAL_SCORE_NEAR_SIDELINE
-
-    # Encorage standing up
-    if not player.has_tackle_zone(): score += 30
+    if helper.distance_to_sideline(game, to_square) == 0: score += SearchBot.ADDITIONAL_SCORE_SIDELINE
+    if helper.distance_to_sideline(game, to_square) == 1: score += SearchBot.ADDITIONAL_SCORE_NEAR_SIDELINE
 
     return score, is_complete, description
 
 
-def score_receiving_position(game: Game, heat_map: helper.FfHeatMap, player: Player, to_square: Square) -> (float, bool):
+def score_receiving_position(game: Game, player: Player, to_square: Square) -> (float, bool):
     ball_carrier = game.get_ball_carrier()
     if (ball_carrier is None or player.team != game.get_ball_carrier().team) or (ball_carrier is not None and player == game.get_ball_carrier()): return 0.0, True
 
@@ -879,14 +856,14 @@ def score_receiving_position(game: Game, heat_map: helper.FfHeatMap, player: Pla
     return score, True
 
 
-def score_move_towards_ball(game: Game, heat_map: helper.FfHeatMap, player: Player, to_square: Square)  -> (float, bool):
+def score_move_towards_ball(game: Game, player: Player, to_square: Square)  -> (float, bool):
     ball_square: Square = game.get_ball_position()
     ball_carrier = game.get_ball_carrier()
     ball_team = ball_carrier.team if ball_carrier is not None else None
 
     if (to_square == ball_square) or ((ball_team is not None) and (ball_team == player.team)): return 0.0, True
 
-    score = RiskBot.BASE_SCORE_MOVE_TOWARD_BALL
+    score = SearchBot.BASE_SCORE_MOVE_TOWARD_BALL
     if ball_carrier is None: score += 20.0
 
     player_distance_to_ball = ball_square.distance(player.position)
@@ -912,14 +889,14 @@ def score_move_towards_ball(game: Game, heat_map: helper.FfHeatMap, player: Play
     return score, True
 
 
-def score_move_to_ball(game: Game, heat_map: helper.FfHeatMap, player: Player, to_square: Square) -> (float, bool):
+def score_move_to_ball(game: Game, player: Player, to_square: Square) -> (float, bool):
     ball_square: Square = game.get_ball_position()
     ball_carrier = game.get_ball_carrier()
     if (ball_square != to_square) or (ball_carrier is not None):
         return 0.0, True
 
-    score = RiskBot.BASE_SCORE_MOVE_TO_BALL
-    if player.has_skill(Skill.SURE_HANDS): score += 15.0
+    score = SearchBot.BASE_SCORE_MOVE_TO_BALL
+    if player.has_skill(Skill.SURE_HANDS) or not player.team.state.reroll_used: score += 15.0
     if player.get_ag() < 2: score += -10.0
     if player.get_ag() == 3: score += 5.0
     if player.get_ag() > 3: score += 10.0
@@ -939,26 +916,26 @@ def score_move_to_ball(game: Game, heat_map: helper.FfHeatMap, player: Player, t
         score += 9
 
     # Cancel the penalty for being near the sideline if the ball is on/near the sideline (it's applied later)
-    if helper.distance_to_sideline(game, ball_square) == 1: score -= RiskBot.ADDITIONAL_SCORE_NEAR_SIDELINE
-    if helper.distance_to_sideline(game, ball_square) == 0: score -= RiskBot.ADDITIONAL_SCORE_SIDELINE
+    if helper.distance_to_sideline(game, ball_square) == 1: score -= SearchBot.ADDITIONAL_SCORE_NEAR_SIDELINE
+    if helper.distance_to_sideline(game, ball_square) == 0: score -= SearchBot.ADDITIONAL_SCORE_SIDELINE
 
     # Need to increase score if no other player is around to get the ball (to do)
 
     return score, False
 
 
-def score_move_ball(game: Game, heat_map: helper.FfHeatMap, player: Player, to_square: Square) -> (float, bool):
+def score_move_ball(game: Game, player: Player, to_square: Square) -> (float, bool):
     # ball_square: Square = game.get_ball_position()
     ball_carrier = game.get_ball_carrier()
     if (ball_carrier is None) or player != ball_carrier: return 0.0, True
 
-    score = RiskBot.BASE_SCORE_MOVE_BALL
+    score = SearchBot.BASE_SCORE_MOVE_BALL
     if helper.in_scoring_endzone(game, player.team, to_square):
         if player.team.state.turn == 8: score += 115.0  # Make overwhelmingly attractive
         else: score += 60.0  # Make scoring attractive
     elif player.team.state.turn == 8: score -= 100.0  # If it's the last turn, heavily penalyse a non-scoring action
     else:
-        score += heat_map.get_ball_move_square_safety_score(to_square)
+        score += 15
         opps: List[Player] = game.get_adjacent_players(to_square, team=game.get_opp_team(player.team), stunned=False)
         if opps: score -= (40.0 + 20.0 * len(opps))
         opps_close_to_destination = helper.players_in(game, player.team, helper.squares_within(game, to_square, 2), include_own=False, include_opp=True, include_stunned=False)
@@ -977,13 +954,13 @@ def score_move_ball(game: Game, heat_map: helper.FfHeatMap, player: Player, to_s
     return score, True
 
 
-def score_sweep(game: Game, heat_map: helper.FfHeatMap, player: Player, to_square: Square) -> (float, bool):
+def score_sweep(game: Game, player: Player, to_square: Square) -> (float, bool):
     ball_carrier = game.get_ball_carrier()
     if ball_carrier is not None and ball_carrier.team == player.team: return 0.0, True  # Don't sweep unless the other team has the ball
     if helper.distance_to_defending_endzone(game, player.team, game.get_ball_position()) < 9: return 0.0, True  # Don't sweep when the ball is close to the endzone
     if helper.players_in_scoring_distance(game, player.team, include_own=False, include_opp=True): return 0.0, True  # Don't sweep when there are opponent units in scoring range
 
-    score = RiskBot.BASE_SCORE_MOVE_TO_SWEEP
+    score = SearchBot.BASE_SCORE_MOVE_TO_SWEEP
     blitziness = player_blitz_ability(game, player)
     score += blitziness - 60.0
     score -= 30.0 * len(game.get_adjacent_opponents(player))
@@ -1007,7 +984,7 @@ def score_sweep(game: Game, heat_map: helper.FfHeatMap, player: Player, to_squar
     return score, True
 
 
-def score_defensive_screen(game: Game, heat_map: helper.FfHeatMap, player: Player, to_square: Square) -> (float, bool):
+def score_defensive_screen(game: Game, player: Player, to_square: Square) -> (float, bool):
     ball_carrier = game.get_ball_carrier()
     ball_square = game.get_ball_position()
     ball_team = ball_carrier.team if ball_carrier is not None else None
@@ -1022,7 +999,7 @@ def score_defensive_screen(game: Game, heat_map: helper.FfHeatMap, player: Playe
     #    Decrease if close to a player on the same team WHO IS ALREADY screening.
     #    Increase slightly if most of the players movement must be used to arrive at the screening square.
 
-    score = RiskBot.BASE_SCORE_DEFENSIVE_SCREEN
+    score = SearchBot.BASE_SCORE_DEFENSIVE_SCREEN
 
     distance_ball_carrier_to_end = helper.distance_to_defending_endzone(game, player.team, ball_square)
     distance_square_to_end = helper.distance_to_defending_endzone(game, player.team, to_square)
@@ -1036,7 +1013,7 @@ def score_defensive_screen(game: Game, heat_map: helper.FfHeatMap, player: Playe
     if distance_to_closest_opponent <= 1.5: score -= 30.0
     elif distance_to_closest_opponent <= 2.95: score += 10.0
     elif distance_to_closest_opponent > 2.95: score += 5.0
-    if helper.distance_to_sideline(game, to_square) == 1: score -= RiskBot.ADDITIONAL_SCORE_NEAR_SIDELINE  # Cancel the negative score of being 1 from sideline.
+    if helper.distance_to_sideline(game, to_square) == 1: score -= SearchBot.ADDITIONAL_SCORE_NEAR_SIDELINE  # Cancel the negative score of being 1 from sideline.
 
     distance_to_closest_friendly_used = helper.distance_to_nearest_player(game, player.team, to_square, include_own=True, include_opp=False, only_used=True)
     if distance_to_closest_friendly_used >= 4: score += 2.0
@@ -1053,7 +1030,7 @@ def score_defensive_screen(game: Game, heat_map: helper.FfHeatMap, player: Playe
     return score, True
 
 
-def score_offensive_screen(game: Game, heat_map: helper.FfHeatMap, player: Player, to_square: Square) -> (float, bool):
+def score_offensive_screen(game: Game, player: Player, to_square: Square) -> (float, bool):
 
     # Another subtle one.  Basically if the ball carrier "breaks out", I want to screen him from
     # behind, rather than cage him.  I may even want to do this with an important receiver.
@@ -1071,7 +1048,7 @@ def score_offensive_screen(game: Game, heat_map: helper.FfHeatMap, player: Playe
     return score, True
 
 
-def score_caging(game: Game, heat_map: helper.FfHeatMap, player: Player, to_square: Square) -> (float, bool):
+def score_caging(game: Game, player: Player, to_square: Square) -> (float, bool):
     ball_carrier: Player = game.get_ball_carrier()
     if ball_carrier is None or ball_carrier.team != player.team or ball_carrier == player: return 0.0, True          # Noone has the ball.  Don't try to cage.
     ball_square: Square = game.get_ball_position()
@@ -1089,22 +1066,21 @@ def score_caging(game: Game, heat_map: helper.FfHeatMap, player: Player, to_squa
     for curGroup in cage_square_groups:
         if to_square in curGroup and not helper.players_in(game, player.team, curGroup, include_opp=False, include_own=True, only_blockable=True):
             # Test square is inside the cage corner and no player occupies the corner
-            if to_square in curGroup: score = RiskBot.BASE_SCORE_CAGE_BALL
+            if to_square in curGroup: score = SearchBot.BASE_SCORE_CAGE_BALL
             dist = helper.distance_to_nearest_player(game, player.team, to_square, include_own=False, include_stunned=False, include_opp=True)
             score += dist_opp_to_ball - dist
             if dist_opp_to_ball > avg_opp_ma: score -= 30.0
             if not ball_carrier.state.used: score -= 30.0
             if to_square.is_adjacent(game.get_ball_position()): score += 5
             if helper.is_bishop_position_of(game, player, ball_carrier): score -= 2
-            score += heat_map.get_cage_necessity_score(to_square)
-            if not ball_carrier.state.used: score = max(0.0, score - RiskBot.BASE_SCORE_CAGE_BALL)  # Penalise forming a cage if ball carrier has yet to move
+            if not ball_carrier.state.used: score = max(0.0, score - SearchBot.BASE_SCORE_CAGE_BALL)  # Penalise forming a cage if ball carrier has yet to move
             if not player.state.up: score += 5.0
             return score, True
 
     return 0, True
 
 
-def score_mark_opponent(game: Game, heat_map: helper.FfHeatMap, player: Player, to_square: Square) -> (float, bool):
+def score_mark_opponent(game: Game, player: Player, to_square: Square) -> (float, bool):
 
     # Modification - no need to mark prone opponents already marked
 
@@ -1119,7 +1095,7 @@ def score_mark_opponent(game: Game, heat_map: helper.FfHeatMap, player: Player, 
     if (ball_carrier is not None) and (ball_carrier == player):
         return 0.0, True
 
-    score = RiskBot.BASE_SCORE_MOVE_TO_OPPONENT
+    score = SearchBot.BASE_SCORE_MOVE_TO_OPPONENT
     if to_square.is_adjacent(game.get_ball_position()):
         if team_with_ball == player.team: score += 20.0
         else: score += 30.0
@@ -1163,21 +1139,20 @@ def score_mark_opponent(game: Game, heat_map: helper.FfHeatMap, player: Player, 
     return score, True
 
 
-def score_handoff(game: Game, heat_map: helper.FfHeatMap, ball_carrier: Player, receiver: Player, from_square: Square) -> float:
+def score_handoff(game: Game, ball_carrier: Player, receiver: Player, from_square: Square) -> float:
     if receiver == ball_carrier: return 0.0
 
-    score = RiskBot.BASE_SCORE_HANDOFF
+    score = SearchBot.BASE_SCORE_HANDOFF
     score += probability_fail_to_score(probability_catch_fail(game, receiver))
     if not ball_carrier.team.state.reroll_used: score += +10.0
     score -= 5.0 * (helper.distance_to_scoring_endzone(game, ball_carrier.team, receiver.position) - helper.distance_to_scoring_endzone(game, ball_carrier.team, ball_carrier.position))
     if receiver.state.used: score -= 30.0
     if (game.num_tackle_zones_in(ball_carrier) > 0 or game.num_tackle_zones_in(receiver) > 0) and not helper.blitz_used(game): score -= 50.0  # Don't try a risky hand-off if we haven't blitzed yet
     if helper.in_scoring_range(game, receiver) and not helper.in_scoring_range(game, ball_carrier): score += 40.0
-    # score += heat_map.get_ball_move_square_safety_score(receiver.position)
     return score
 
 
-def score_pass(game: Game, heat_map: helper.FfHeatMap, passer: Player, from_square: Square, to_square: Square) -> float:
+def score_pass(game: Game, passer: Player, from_square: Square, to_square: Square) -> float:
 
     receiver = game.get_player_at(to_square)
 
@@ -1185,7 +1160,7 @@ def score_pass(game: Game, heat_map: helper.FfHeatMap, passer: Player, from_squa
     if receiver.team != passer.team: return 0.0
     if receiver == passer: return 0.0
 
-    score = RiskBot.BASE_SCORE_PASS
+    score = SearchBot.BASE_SCORE_PASS
     score += probability_fail_to_score(probability_catch_fail(game, receiver))
     dist: PassDistance = game.get_pass_distance(from_square, receiver.position)
     score += probability_fail_to_score(probability_pass_fail(game, passer, from_square, dist))
@@ -1197,8 +1172,8 @@ def score_pass(game: Game, heat_map: helper.FfHeatMap, passer: Player, from_squa
     return score
 
 
-def score_block(game: Game, heat_map: helper.FfHeatMap, attacker: Player, defender: Player) -> float:
-    score = RiskBot.BASE_SCORE_BLOCK
+def score_block(game: Game, attacker: Player, defender: Player) -> float:
+    score = SearchBot.BASE_SCORE_BLOCK
     ball_carrier = game.get_ball_carrier()
     ball_square = game.get_ball_position()
     if attacker.has_skill(Skill.CHAINSAW):
@@ -1221,18 +1196,13 @@ def score_block(game: Game, heat_map: helper.FfHeatMap, attacker: Player, defend
         if attacker.has_skill(Skill.LONER): score -= 10.0
 
     if attacker == ball_carrier: score += -45.0
-    if defender == ball_carrier: score += 50.0
-    if defender.position.is_adjacent(ball_square): score += 30.0
-
-    score += 24.0 - 3 * defender.get_av()
-    score += defender.role.cost / 3000
-    score -= 14.0 + attacker.role.cost / 10000
+    if defender == ball_carrier: score += 35.0
+    if defender.position.is_adjacent(ball_square): score += 15.0
 
     return score
 
 
 def score_push(game: Game, from_square: Square, to_square: Square) -> float:
-    if helper.in_scoring_endzone(game, game.get_player_at(from_square).team, to_square):  return -100
     score = 0.0
     ball_square = game.get_ball_position()
     if helper.distance_to_sideline(game, to_square) == 0: score = score + 10.0    # Push towards sideline
@@ -1316,22 +1286,22 @@ def check_reroll_block(game: Game, team: Team, block_results: List[ActionSequenc
     else: return False
 
 
-def scoring_urgency_score(game: Game, heat_map: helper.FfHeatMap, player: Player) -> float:
+def scoring_urgency_score(game: Game, player: Player) -> float:
     if player.team.state.turn == 8: return 40
     return 0
 
 
-def path_cost_to_score(path: pf.Path, num_unmoved) -> float:
+def path_cost_to_score(path: pf.Path) -> float:
     cost: float = path.cost
 
     # assert 0 <= cost <= 1
 
-    score = cost * (RiskBot.BASE_SCORE_TURNOVER + num_unmoved * RiskBot.BASE_SCORE_TURNOVER_UNMOVED_PLAYER)
+    score = -(cost * cost * (250.0 + SearchBot.ADDITIONAL_SCORE_DODGE))
     return score
 
 
 def probability_fail_to_score(probability: float) -> float:
-    score = -(probability * probability * (250.0 + RiskBot.ADDITIONAL_SCORE_DODGE))
+    score = -(probability * probability * (250.0 + SearchBot.ADDITIONAL_SCORE_DODGE))
     return score
 
 
@@ -1502,9 +1472,495 @@ def player_value(game: Game, player: Player) -> float:
     value = player.get_ag()*40 + player.get_av()*30 + player.get_ma()*30 + player.get_st()*50 + len(player.get_skills())*20
     return value
 
+def armor_normalized_value(player: Player) -> float:
+    value = player.role.cost / 1000 + 15 * (8 - player.get_av)  # approx value if armor were 8
+
+def MCTSearch(self, game: Game, team: Team):
+    if self.startNewSearch:    # brand new search
+        if self.tree != None:
+            timeZeroIterations = self.tree.root.timesVisited
+        else:
+            timeZeroIterations = 0
+            CreateTree(self, self.search_state, game, team)
+        self.nextNodeId = 1
+        game_original = game
+
+        # only 1 choice, don't think - or sometimes randomly
+        if len(self.currNode.actionList) == 1:
+            quickMove = self.currNode.actionList[0]
+
+            # delete or trim tree - never save due to card draws
+            if len(self.tree.root.sons) > 0 and self.tree.root.sons[0].toPlay == self.my_team:   # I'm going to have the next move
+                self.tree.saveOneBranch(quickMove)
+                self.currNode = self.tree.root
+            else:
+                self.tree.saveOneBranch(None) # delete whole thing
+            if self.tree.root == None:
+                self.tree = None
+
+            self.current_move = quickMove
+            return
+
+        self.startNewSearch = False
+        stopSearching = False
+        nextIterationCheck = self.maxIterations / 2 + 1 # maybe stop searching if one move is superior
+        self.verbose = False
+
+        while (not stopSearching):   # do multiple simulations
+            game_copy = deepcopy(game_original)  # a copy I can simulate on
+            game_copy.home_agent = self # set both players to me
+            game_copy.away_agent = self # set both players to me
+            game = game_copy
+            team = self.my_team
+            self.createdNewNode = False
+            self.alreadyScored = False
+
+            # call this function again, but startNewSearch won't trip
+            MCTSearch(self, game_copy, team)
+
+            # score the game and execute all of the evaluation actions
+            if (self.tree.root.timesVisited >= nextIterationCheck):
+                stopSearching, nextIterationCheck = self.tree.endEarly(self.maxIterations)
+
+        # all done simulating
+        self.verbose = True
+        self.startNewSearch = True
+        game = game_original
+        team = self.my_team
+        temperature =  0.0001
+        selectedMove = self.tree.pickTemperatureMove(temperature, game.rnd, False)
+        sonIndex = self.tree.root.whichSonHadMove(selectedMove)
+
+        #printFinalUctSummary()
+
+        # delete or trim tree
+        if sonIndex < len(self.tree.root.sons) and (self.tree.root.sons[sonIndex].toPlay == self.my_team):   # I'm going to have the next move
+            self.tree.saveOneBranch(selectedMove)
+            self.currNode = self.tree.root
+        else:
+            self.tree.saveOneBranch(None) # delete whole thing
+        if self.tree.root == None:
+            self.tree = None
+
+        self.current_move = selectedMove
+        return
+
+    # we are traversing a tree
+    if self.createdNewNode:
+        initializeNewNode(self, game, team, self.currNode)
+        self.createdNewNode = False
+
+    if self.alreadyScored:
+        return
+
+    if self.currNode.isTerminal():    # game is over
+        self.current_score = evaluate_game(self, game)
+        propagate_score(self)   # traverse back up the tree
+        return
+    if self.currNode.toPlay != team:
+        raise Exception("Wrong team trying to play!")
+    firstPlayUrgency = 9999
+    self.currNode, self.createdNewNode, self.nextNodeId = self.currNode.highestUctSon(self.exploreC, self.nextNodeId, self.currNode.father == None, firstPlayUrgency)
+
+    # createdNewNode could be turned on at this point, but there's nothing to do yet.  Do action first and initialize in next call.
+    do_selected_move(self, game, team, ActionSequence(list(self.currNode.actionFromFather.action_steps)))
+
+
+def do_selected_move(self, game: Game, team: Team, move: ActionSequence):
+    self.current_move = move
+    action: Action = self.current_move.popleft()
+    # Correct player object
+    if action.player is not None:
+        action.player = game.state.player_by_id[action.player.player_id]
+    game.step(action)
+
+def evaluate_game(self, game):
+    self.alreadyScored = True
+    game.stop = True    # signals stop
+    self.current_move = None
+    myPlayers: List[Player] = helper.get_players(game, self.my_team, include_own=True, include_opp=False, include_used=True, only_used=False, include_off_pitch=True)
+
+
+
+    return 0    # TODO
+
+
+def initializeNewNode(self, game, team, node):
+    node.toPlay = team
+
+    # find all legal moves for this node
+    node.actionList = GetLegalMovesByState(self, game, team)
+
+    # modify with prior probabilities - TODO
+ 
+    # only stop if at start of turn or wakeup
+    if (node.father != None and self.search_state == SearchState.SELECT_PLAYER):
+        self.current_score = evaluate_game(self, game)
+        propagate_score(self)   # traverse back up the tree
+
+
+def propagate_score(self):
+    while True:
+        if self.currNode.toPlay == self.my_team:
+            self.currNode.updateValueTimes(self.current_score)
+        else:
+            self.currNode.updateValueTimes(-self.current_score)
+        if self.currNode.father == None:
+            break
+        self.currNode = self.currNode.father
+
+    if (self.currNode != self.tree.root):
+        raise Exception("Not at root!")
+
+def printFinalUctSummary(self):
+    # prints a summary of all possible moves and their average values (for debugging)
+    for childNode in self.tree.root.sons:
+        print("MOVE: " + childNode.moveFromFather[0])   # TODO: some kind of description possible?
+        print("\tTIMES VISITED: " + childNode.timesVisited + "\tAVERAGE RESULT: " + childNode.avgValue)
+
+        # print sub-children
+        #                for subchildNode in childNode.sons:
+                            #print("\tSUBMOVE: {0}", subchildNode.actionFromFather)    # TODO: some kind of description possible?
+                            #print("\tTIMES VISITED: {0}\tAVERAGE RESULT: {1}", subchildNode.timesVisited, subchildNode.avgValue)
+    print("\n")
+
+def RandomizeMoves(moveList, rnd: np.random.RandomState):
+    n = moveList.Count
+    while (n > 1):
+        n -= 1
+        k = rnd.randrange(n + 1)
+        value = moveList[k]
+        moveList[k] = moveList[n]
+        moveList[n] = value
+
+def CreateTree(self, state, game: Game, team):
+    self.tree = MCTSTree(self.exploreC, game.state.teams, self.my_team)
+    self.currNode = self.tree.root
+    initializeNewNode(self, game, team, self.currNode)
+
+
+def GetLegalMovesByState(self, game, team):
+    move_list = []
+    if self.search_state == SearchState.SELECT_PLAYER:
+        for action_choice in game.state.available_actions: 
+            for player in action_choice.players:
+                action_steps = [Action(action_choice.action_type, None, player)]
+                move_list.append(ActionSequence(action_steps))
+    else:
+        raise Exception("Shouldn't be called for this game state")
+    return move_list
+
+
+class MCTSNode:
+
+    def __init__(self, parent, id_num):
+        self.DEFAULT_AVG_SCORE = 0.0
+        self.INF = 1000000.0	# a big number
+        self.sons = [] # nodes from the moves I can get to (self.sons only created when visited so
+                                                            # there can be more legal moves than self.sons if the search hasn't
+                                                            # visited all the self.sons yet
+        self.father = parent             # the prior node
+        self.actionFromFather = None         # move my self.father made to pick this node
+        self.actionList = []  # a list of all legal moves from here
+        self.timesVisited = 0            # number of times I visited node in selection phase
+        self.toPlay = None    # game needs to set
+        self.id_num = id_num
+        self.use_prior_prob = False
+        self.prior_prob = []
+        self.avg_value = 0.0 if parent == None else parent.avg_value
+
+    def numLegalMoves(self):
+        return len(self.actionList)
+
+    def deleteAllSons(self):
+        originalSons = len(self.sons)
+        if originalSons > 0:
+            for i in range(originalSons, -1, -1):  # go backwards
+                # tell son to delete its self.sons first
+                self.sons[i].deleteAllSons()
+                self.sons.pop(i)
+
+    def deleteSonWithMove(self, move):
+        index = self.actionList.index(move)
+        self.sons[index].deleteAllSons()
+        self.sons[index].pop()
+        self.actionList[index].pop()
+
+    def addSon(self, nextNodeId):
+        if len(self.sons) == self.numLegalMoves():
+            return # no more self.sons can be made
+
+        index = len(self.sons) # before son is added
+        self.sons.append(self.createSon(nextNodeId))
+
+        # add move from self.father to newly created son
+        self.sons[index].actionFromFather = self.actionList[index]
+
+    def createSon(self, nextNodeId):
+        createdSon = MCTSNode(self, nextNodeId)
+        return createdSon
+
+    def isLeaf(self):
+        return len(self.sons) == 0 
+
+    def isTerminal(self):
+        return self.numLegalMoves() == 0 
+
+    def isBranch(self):
+        return self.numLegalMoves() > 1 
+
+    def iGoAgain(self):
+        return self.whoPickedMove() == self.toPlay 
+
+    def updateValueTimes(self, newGameValue):
+        self.avg_value = (self.avg_value * self.timesVisited + newGameValue) / (self.timesVisited + 1)
+        self.timesVisited += 1
+
+    def createActionList(self, treeMoveList):
+        self.actionList = treeMoveList    # copy List
+
+    def root(self):
+        if self.father == None:
+            return self
+        else:
+            return self.father.root()  # continue to search upwards
+
+    def highestCountSon(self):
+        index = -1
+        highest = 0
+        for i in range(len(self.sons)):
+            if self.sons[i].timesVisited > highest:
+                highest = self.sons[i].timesVisited
+                index = i
+        if index >= 0:
+            return self.sons[index]
+        return None
+
+    def highestLCBSon(self):
+        highSon = None
+        mostCount = 0
+        highLCB = -999.0
+        for son in self.sons:
+            if son.timesVisited > mostCount:
+                mostCount = son.timesVisited
+            if self.timesVisited >= mostCount / 10:
+                lcb = son.avg_value - 3.1 / math.sqrt(self.timesVisited)
+                if lcb > highLCB:
+                    highLCB = lcb
+                    highSon = son
+        # make sure it has at least 10% of most visits
+        if highSon.timesVisited < mostCount / 10:
+            # repeat again
+            highLCB = -999
+            highSon = None
+            for son in self.sons:
+                if self.timesVisited >= mostCount / 10:
+                    lcb = highSon.avg_value - 3.1 / math.sqrt(self.timesVisited)
+                    if lcb > highLCB:
+                        highLCB = lcb
+                        highSon = son
+        return highSon
+
+    def highestUctSon(self, origExplConst, nextNodeId, useSqrt, fpu):
+        if self.isTerminal():
+            return None
+
+        # check values of self.sons that have been created
+        sonUctVal = -self.INF
+        highest = -self.INF
+        highestSon = -1
+        for candidate in range(len(self.sons)):
+            expl = origExplConst
+            if self.use_prior_prob:
+                expl *= self.prior_prob[candidate]
+            sonUctVal = self.sons[candidate].getUctValue(expl, useSqrt)
+
+            if sonUctVal > highest:
+                highestSon = candidate
+                highest = sonUctVal
+
+        # check values of unmade self.sons
+        makeNew = False
+        for candidate in range(len(self.sons), self.numLegalMoves()):
+            expl = origExplConst
+            if self.use_prior_prob:
+                expl *= self.prior_prob[candidate]
+            if useSqrt:
+                sonUctVal = fpu + expl * math.sqrt(math.sqrt(self.timesVisited + 1))
+            else:
+                sonUctVal = fpu + expl * math.sqrt(math.log(self.timesVisited + 1))
+
+            if sonUctVal > highest:
+                makeNew = True
+                highestSon = candidate
+                highest = sonUctVal
+            if not self.use_prior_prob:
+                break  # all unmade will have same value
+
+        if highestSon < 0:
+            raise Exception("Couldn't find valid move")
+
+        if makeNew:
+            # move best candidate to top of list
+            new_position = len(self.sons)
+            if highestSon != new_position:
+                self.actionList[highestSon], self.actionList[new_position] = self.actionList[new_position], self.actionList[highestSon]
+                self.prior_prob[highestSon], self.prior_prob[new_position] = self.prior_prob[new_position], self.prior_prob[highestSon]
+
+            self.addSon(nextNodeId)
+            nextNodeId += 1
+            return self.sons[new_position], True, nextNodeId
+        else:
+            return self.sons[highestSon], False, nextNodeId
+
+    def getLegalAction(self, index):
+        if index < 0 or index >= self.numLegalMoves():
+            return None
+        else:
+            return self.actionList[index]
+
+    def getUctValue(self, explConst, useSqrt):
+        if useSqrt:
+            return self.avg_value + explConst * math.sqrt(math.sqrt(self.father.timesVisited) / self.timesVisited)
+        else:
+            return self.avg_value + explConst * math.sqrt(math.log(self.father.timesVisited) / self.timesVisited)
+
+    def getPuctValue(self, explConst, priorProb):
+        return self.avg_value + priorProb * explConst * math.sqrt(self.father.timesVisited) / (1 + self.timesVisited)
+
+    def whoPickedMove(self):
+        if self.father == None:
+            return -1
+        return self.father.toPlay
+
+    def iPickedPriorMove(self):
+        if self.father == None:
+            return False   # may not be True, but don't care
+        return self.father.toPlay == self.father.whoPickedMove()
+
+    def whichSonHadMove(self, move):
+        for i in range(len(self.actionList)):
+            if self.actionList[i] == move:
+                return i
+        return -1
+
+def actions_equal(action1: helper.Action, action2: helper.Action):
+    return action1.player == action2.player and action1.action_type == action2.action_type and action1.position == action2.position
+
+def action_sequences_equal(move1: helper.ActionSequence, move2: helper.ActionSequence):
+    if len(move1.action_steps) != len(move2.action_steps):
+        return False
+    for i in range(len(move2.action_steps)):
+        if not actions_equal(move1.action_steps[i], move2.action_steps[i]):
+            return False
+    return True
+            
+
+class MCTSTree:
+
+    def __init__(self, expConst, teams, current_team):
+        self.P_SECOND = 0.4
+        self.root = MCTSNode(None, 0)
+        self.num_simulations = 0
+        self.explore_const = expConst    # the 'c' exploration constant for UCT search
+
+        self.owner = current_team
+
+        # set the toPlay for this first node
+        self.root.toPlay = self.owner
+
+    def pickTemperatureMove(self, temperature, rnd: np.random.RandomState, lowerConfBound):
+        if lowerConfBound and temperature < 0.5:
+            return self.root.highestLCBSon().actionFromFather
+
+        # select a move semi-randomly based on temperature (high temperature = more random)
+        if temperature > 99:
+            # pick randomly and I might not have visited all my sons
+            return self.root.actionList[rnd.randrange(len(self.root.actionList))]
+        if temperature < .01:
+            # always choose most frequent
+            return self.pickFrequentChildMove()
+
+        # assumes temperature is 1 for quick computation
+        total = 0
+        for candidate in self.root.sons:
+            total += candidate.timesVisited
+
+        choice = rnd.randrange(total)
+
+        for candidate in self.root.sons:
+            if choice < candidate.timesVisited:
+                return candidate.actionFromFather
+            choice -= candidate.timesVisited
+        raise Exception("Can't find best move")
+
+
+    def pickFrequentChildMove(self):
+        # which child did I visted most often?
+        highest = 0
+        bestMove = None
+        for candidate in self.root.sons:
+            freqScore = candidate.timesVisited
+            if freqScore > highest:
+                bestMove = candidate.actionFromFather
+                highest = freqScore
+        if bestMove == None:
+            raise Exception("No sons available")
+        return bestMove
+
+    def saveOneBranch(self, move: helper.ActionSequence):
+        # this function saves one branch of the tree for reuse in the next move.  It deletes the rest of the tree
+        originalSons = len(self.root.sons)
+        index = 0
+        for i in range(originalSons):
+            if action_sequences_equal(self.root.sons[index].actionFromFather, move):
+                index = 1
+                continue   # skip over this move
+            self.root.sons[index].deleteAllSons()   # cascades to its children too
+            self.root.sons.pop(index)
+
+        # set a new self.root at the son
+        if len(self.root.sons) == 1:
+            self.root = self.root.sons[0]
+            self.root.father = None
+            self.root.actionFromFather = None
+        elif (move == None):
+            self.root = None
+        else:
+            raise Exception ("Couldn't find move or has duplicate move")
+
+        # sometimes my chosen son doesn't have a full set of sons and that causes problems later
+        if self.root != None and (self.root.toPlay == None or len(self.root.sons) < len(self.root.actionList)):
+            self.saveOneBranch(None)  # delete the whole tree
+
+    def endEarly(self, maxSimulations):
+        if self.root.timesVisited >= maxSimulations:
+            return True, 0
+
+        # what are my top 2 move counts?
+        highCount = 0
+        secondCount = 0
+        for candidate in self.root.sons:
+            freqScore = candidate.timesVisited
+            if freqScore > highCount:
+                secondCount = highCount
+                highCount = freqScore
+            elif freqScore > secondCount:
+                secondCount = freqScore
+
+        # what fraction of the remaining simulations should I wait before I check again?
+        fraction = 1.1 * (self.P_SECOND - (float)(highCount - secondCount) / (maxSimulations - self.root.timesVisited)) / (1 + self.P_SECOND)
+        if fraction <= 0:
+            return True, 0    # stop
+
+        # I still have to wait
+        nextCheck = (int)(self.root.timesVisited + fraction * (maxSimulations - self.root.timesVisited) + 1)
+
+        return False, nextCheck	# don't stop yet
+
 
 # Register bot
-register_bot('RiskBot', RiskBot)
+register_bot('SearchBot', SearchBot)
 
 
 def main():
@@ -1521,10 +1977,10 @@ def main():
 
     # Play 5 games as away
     for i in range(5):
-        away_agent = make_bot('riskbot')
-        away_agent.name = 'riskbot'
-        home_agent = make_bot('grodbot')
-        home_agent.name = 'grodbot'
+        away_agent = make_bot('searchbot')
+        away_agent.name = 'searchbot'
+        home_agent = make_bot('scripted')
+        home_agent.name = 'scripted'
         config.debug_mode = False
         game = Game(i, home, away, home_agent, away_agent, config, arena=arena, ruleset=ruleset)
         game.config.fast_mode = True
@@ -1537,10 +1993,10 @@ def main():
 
     # Play 5 games as home
     for i in range(5):
-        away_agent = make_bot('grodbot')
-        away_agent.name = 'grodbot'
-        home_agent = make_bot('riskbot')
-        home_agent.name = 'riskbot'
+        away_agent = make_bot('scripted')
+        away_agent.name = 'scripted'
+        home_agent = make_bot('searchbot')
+        home_agent.name = 'searchbot'
         config.debug_mode = False
         game = Game(i, home, away, home_agent, away_agent, config, arena=arena, ruleset=ruleset)
         game.config.fast_mode = True
