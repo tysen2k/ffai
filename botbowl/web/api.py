@@ -34,7 +34,7 @@ game_modes = {
 }
 
 
-def new_game(away_team_name, home_team_name, away_agent=None, home_agent=None, game_mode='Standard'):
+def new_game(away_team_name, home_team_name, away_agent=None, home_agent=None, game_mode='standard'):
     assert away_agent is not None
     assert home_agent is not None
     config_name = game_modes[game_mode]
