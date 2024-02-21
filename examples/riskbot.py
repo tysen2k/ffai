@@ -421,7 +421,8 @@ class RiskBot(ProcBot):
                 players_available: List[m.Player] = action_choice.players
                 for player in players_available:
                     paths = paths_own[player]
-                    all_actions.extend(BotHelper.potential_move_actions(game, heat_map, player, paths, num_unmoved, self.variant))
+                    do_nothing_score = BotHelper.do_nothing_score(game, heat_map, player, self.variant)
+                    all_actions.extend(BotHelper.potential_move_actions(game, heat_map, player, paths, num_unmoved, do_nothing_score))
             elif action_choice.action_type == t.ActionType.START_BLITZ:
                 players_available: List[m.Player] = action_choice.players
                 for player in players_available:
@@ -484,12 +485,13 @@ class RiskBot(ProcBot):
 
         player: m.Player = game.state.active_player
         paths = pf.get_all_paths(game, player, blitz=False)
+        do_nothing_score = BotHelper.do_nothing_score(game, self.heat_map, player, self.variant)
 
         all_actions: List[ActionSequence] = []
         for action_choice in game.state.available_actions:
             if action_choice.action_type == t.ActionType.MOVE:
                 players_available: List[m.Player] = action_choice.players
-                all_actions.extend(BotHelper.potential_move_actions(game, self.heat_map, player, paths, num_unmoved, self.variant, is_continuation=True))
+                all_actions.extend(BotHelper.potential_move_actions(game, self.heat_map, player, paths, num_unmoved, do_nothing_score, is_continuation=True))
             elif action_choice.action_type == t.ActionType.END_PLAYER_TURN:
                 all_actions.extend(BotHelper.potential_end_player_turn_action(game, self.heat_map, player))
 
@@ -1416,8 +1418,8 @@ class BotHelper:
                 # potential action -> sequence of steps such as "START_MOVE, MOVE (to square) etc
         return move_actions
 
-    def potential_move_actions(game: g.Game, heat_map: FfHeatMap, player: m.Player, paths: List[pf.Path], num_unmoved, variant: bool, is_continuation: bool = False) -> List[ActionSequence]:
-
+    @staticmethod
+    def do_nothing_score(game: g.Game, heat_map: FfHeatMap, player: m.Player, variant: bool) -> float:
         do_nothing_score = 0
         if variant and player.has_tackle_zone():
             do_nothing_score, is_complete, description = BotHelper.score_move(game, heat_map, player, player.position, 1)
@@ -1427,7 +1429,9 @@ class BotHelper:
                 do_nothing_score -= 20
             if do_nothing_score < 0:
                 do_nothing_score = 0
+        return do_nothing_score
 
+    def potential_move_actions(game: g.Game, heat_map: FfHeatMap, player: m.Player, paths: List[pf.Path], num_unmoved, do_nothing_score: float, is_continuation: bool = False) -> List[ActionSequence]:
         move_actions: List[ActionSequence] = []
         ball_square: m.Square = game.get_ball_position()
         if not player.has_tackle_zone():
