@@ -4,12 +4,14 @@ import botbowl.core.model as m
 import botbowl.core.table as t
 import botbowl.core.procedure as p
 import botbowl.core.pathfinding as pf
-from botbowl import Action, ActionType, Square, BBDieResult, Skill, Formation, ProcBot
 from typing import Optional, List, Dict, Tuple
 import botbowl.core.game as g
 import numpy as np
 import time
 from grodbot import *
+from scripted_bot_example import *
+import sys
+from botbowl import Action, ActionType, Square, BBDieResult, Skill, Formation, ProcBot
 
 """
 RiskBot
@@ -30,16 +32,16 @@ class RiskBot(ProcBot):
     mean_actions_available = []
     steps = []
 
-    BASE_SCORE_BLITZ = 60.0
-    BASE_SCORE_FOUL = -50.0
-    BASE_SCORE_BLOCK = 65   # For a two dice block
+    BASE_SCORE_BLITZ = 35.0   # For a two dice block - additions are made for victim value
+    BASE_SCORE_FOUL = 0     # -50.0
+    BASE_SCORE_BLOCK = 53.0   # For a two dice block - additions are made for victim value
     BASE_SCORE_HANDOFF = 40.0
     BASE_SCORE_PASS = 40.0
-    BASE_SCORE_MOVE_TO_OPPONENT = 45.0
+    BASE_SCORE_MOVE_TO_OPPONENT = 25.0
     BASE_SCORE_MOVE_BALL = 45.0
     BASE_SCORE_MOVE_TOWARD_BALL = 45.0
     BASE_SCORE_MOVE_TO_SWEEP = 0.0
-    BASE_SCORE_CAGE_BALL = 75.0
+    BASE_SCORE_CAGE_BALL = 60.0
     BASE_SCORE_MOVE_TO_BALL = 65.0
     BASE_SCORE_BALL_AND_CHAIN = 75.0
     BASE_SCORE_DEFENSIVE_SCREEN = -10.0
@@ -47,8 +49,10 @@ class RiskBot(ProcBot):
     ADDITIONAL_SCORE_NEAR_SIDELINE = -20.0
     ADDITIONAL_SCORE_SIDELINE = -40.0
     BASE_SCORE_TURNOVER = -30
-    BASE_SCORE_TURNOVER_UNMOVED_PLAYER = -15
+    BASE_SCORE_TURNOVER_UNMOVED_PLAYER = -37
     ADDITIONAL_SCORE_PRONE = 30.0  # Favour moving prone players earlier
+    BALL_POSITION_SCORE_PER_SQUARE = 9.0
+    BALL_CONTROL_SCORE = 120.0
 
     def __init__(self, name):
         super().__init__(name)
@@ -60,6 +64,8 @@ class RiskBot(ProcBot):
         self.heat_map: Optional[FfHeatMap] = None
         self.actions_available = []
         self.variant = False
+        self.rnd = np.random.RandomState(1234)
+
 
     def set_verbose(self, verbose):
         self.verbose = verbose
@@ -173,26 +179,65 @@ class RiskBot(ProcBot):
 
         return action
 
-    def reroll(self, game):
+    def reroll(self, game: g.Game):
         proc = game.get_procedure()
-        # target_roll = proc.context.roll.target
+
+        target_roll = proc.context.roll.target
         # target_higher = proc.context.roll.target_higher
-        # dice = proc.context.roll.dice
-        # num_dice = len(dice)
+        dice = proc.context.roll.dice
+        num_dice = len(dice)
+        ball_square = game.get_ball_position()
+
+        if isinstance(proc.context, p.Block):
+            reroll = BotHelper.check_reroll_block(game, self.my_team, proc.context, proc.context.favor)
+            if reroll:
+                if proc.can_use_pro:
+                    return m.Action(t.ActionType.USE_SKILL)
+                # check if meets threshold below
+            else:
+                return m.Action(t.ActionType.DONT_USE_REROLL)
+            if ball_square != proc.context.attacker.position:
+                ball_square = None
+            if num_dice == 1:
+                success_prob = 0.833 if proc.context.favor == self.my_team else 0.667
+            elif num_dice == 2:
+                success_prob = 0.972 if proc.context.favor == self.my_team else 0.444
+            else:
+                success_prob = 0.995 if proc.context.favor == self.my_team else 0.296
+            player = proc.context.attacker
+        elif isinstance(proc.context, p.PassAttempt):
+            if num_dice == 1:
+                success_prob = min(5, 7 - target_roll) / 6.0
+            else:
+                success_prob = 0.5  #TODO
+            player = proc.context.passer
+        else:
+            if ball_square != proc.context.player.position:
+                ball_square = None
+            if num_dice == 1:
+                success_prob = min(5, 7 - target_roll) / 6.0
+            else:
+                success_prob = 0.5  #TODO
+            player = proc.context.player
+
         if proc.can_use_pro:
             return m.Action(t.ActionType.USE_SKILL)
-        if isinstance(proc.context, p.GFI):
+        
+        if self.my_team.state.rerolls >= self.my_team.state.turn:
             return m.Action(t.ActionType.USE_REROLL)
-        if isinstance(proc.context, p.Dodge):
-            return m.Action(t.ActionType.USE_REROLL)
-        if isinstance(proc.context, p.Catch):
-            return m.Action(t.ActionType.USE_REROLL)
-        if isinstance(proc.context, p.Pickup):
-            return m.Action(t.ActionType.USE_REROLL)
-        else:
-            return m.Action(t.ActionType.USE_REROLL)
+        
+        fall_down = isinstance(proc.context, p.Block) or isinstance(proc.context, p.GFI) or isinstance(proc.context, p.Dodge)
+        num_unmoved = BotHelper.get_num_unmoved(game, self.my_team)
+        
+        value = -BotHelper.turnover_chance_penalty(game, success_prob, num_unmoved, fall_down, ball_square, player, self.variant)
+        min_value_needed = 170 - (170.0 * self.my_team.state.rerolls) / (9 - self.my_team.state.turn)
 
-    def new_game(self, game: g.Game, team):
+        if value >= min_value_needed:
+            return m.Action(t.ActionType.USE_REROLL)
+        return m.Action(t.ActionType.DONT_USE_REROLL)
+
+
+    def new_game(self, game: g.Game, team: g.Team):
         """
         Called when a new game starts.
         """
@@ -249,49 +294,55 @@ class RiskBot(ProcBot):
                     if available_action.action_type == t.ActionType.PLACE_PLAYER:
                         players_available = available_action.players
 
-                players_sorted_value = sorted(players_available, key=lambda x: BotHelper.player_value_thousands(x), reverse=True)
+                players_sorted_value = sorted(players_available, key=lambda x: BotHelper.discounted_player_value(game, x), reverse=True)
                 n_keep: int = min(11, len(players_sorted_value))
                 players_available = players_sorted_value[:n_keep]
 
                 players_sorted_bash = sorted(players_available, key=lambda x: BotHelper.player_bash_ability(game, x), reverse=True)
                 players_sorted_blitz = sorted(players_available, key=lambda x: BotHelper.player_blitz_ability(game, x), reverse=True)
-                players_sorted_value = sorted(players_available, key=lambda x: BotHelper.player_value_thousands(x), reverse=False)
+                players_sorted_value = sorted(players_available, key=lambda x: BotHelper.discounted_player_value(game, x), reverse=False)
                 players_sorted_pass = sorted(players_available, key=lambda x: BotHelper.player_pass_ability(game, x), reverse=True)
+                players_sorted_receive = sorted(players_available, key=lambda x: BotHelper.player_receiver_ability(game, x), reverse=True)
                 players_added = []
 
                 if game.get_receiving_team() == self.my_team:
                     # Receiving
                     place_squares: List[m.Square] = [
                         game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 13), 7),
-                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 13), 8),
                         game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 13), 9),
-                        # Receiver next
-                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 7), 8),
-                        # Support line players
-                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 13), 10),
+                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 13), 8),
                         game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 13), 6),
-                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 12), 4),
-                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 12), 12),
+                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 13), 10),
+                        # passer next
+                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 5), 8),
                         # A bit wide semi-defensive - want catchers here
-                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 11), 3),
-                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 11), 13),
+                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 11), 4),
+                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 11), 12),
+                        # Support line players
+                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 12), 13),
+                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 12), 3),
                         # Extra help at the back
-                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 10), 8)
+                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 7), 8)
                     ]
 
                     for i in range(min(11, len(players_available))):
                         place_square = place_squares.pop(0)
 
                         found = False
-                        if i in [3, 10]:
-                            # 4th player and 11 player are receiving type players
+                        if i in [5]:
+                            # 6th passer
                             while not found:
                                 player = players_sorted_pass.pop(0)
                                 found = player not in players_added
-                        elif i in [0, 1, 2, 4, 5]:
+                        elif i in [0, 1, 2, 3, 4]:
                             # These are my "bash" players"
                             while not found:
                                 player = players_sorted_bash.pop(0)
+                                found = player not in players_added
+                        elif i in [6,7]:
+                            # These are my receivers
+                            while not found:
+                                player = players_sorted_receive.pop(0)
                                 found = player not in players_added
                         else:
                             # Everyone else
@@ -304,34 +355,62 @@ class RiskBot(ProcBot):
                 else:
                     # Kicking
                     place_squares: List[m.Square] = [
-                        # LOS squares first
-                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 13), 5),
-                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 13), 6),
+                        # LOS squares general linemen
+                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 13), 8),
                         game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 13), 7),
+                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 13), 9),
 
-                        # in close support next
-                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 12), 8),
-                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 12), 10),
+                        # in close support strongest
+                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 11), 10),
+                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 11), 6),
 
                         # wings
-                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 12), 3),
-                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 12), 13),
-
-
-                        # in close support second row
-                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 11), 9),
-                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 11), 11),
+                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 11), 3),
+                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 11), 13),
 
                         # wings second row
                         game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 11), 2),
-                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 11), 14)
+                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 11), 14),
+
+                        # in close support second row
+                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 10), 11),
+                        game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 10), 5)
                         ]
+
+                     # if we're behind and desperate
+                    if self.my_team.state.score < game.get_opp_team(self.my_team).state.score:
+                        place_squares: List[m.Square] = [
+                            # LOS squares general linemen
+                            game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 13), 6),
+                            game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 13), 5),
+                            game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 13), 7),
+
+                            # in close support strongest
+                            game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 11), 2),
+                            game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 11), 11),
+                            game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 11), 5),
+                            game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 11), 8),
+                            game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 11), 14),
+
+                            # wings second row
+                            game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 10), 3),
+                            game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 10), 13),
+
+                            # in close support second row
+                            game.get_square(BotHelper.reverse_x_for_right(game, self.my_team, 10), 8),
+                            ]
+                       
 
                     for i in range(min(11, len(players_available))):
                         place_square = place_squares.pop(0)
                         found = False
-                        if i in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]:
-                            # 4th player and 11 player are receiving type players
+                        if i in [0, 1, 2]:
+                            # disposable players
+                            while not found:
+                                player = players_sorted_value.pop(0)
+                                found = player not in players_added
+                        else:
+                            # squares sorted by bashing
                             while not found:
                                 player = players_sorted_bash.pop(0)
                                 found = player not in players_added
@@ -405,8 +484,9 @@ class RiskBot(ProcBot):
         players_opponent: List[m.Player] = BotHelper.get_players(game, self.my_team, include_own=False, include_opp=True, include_stunned=False)
         paths_opposition: Dict[m.Player, List[pf.Path]] = dict()
         for player in players_opponent:
-            paths = pf.get_all_paths(game, player, from_position=None)
+            paths = pf.get_all_paths(game, player, from_position=None, blitz=True)
             paths_opposition[player] = paths
+
 
         # Create a heat-map of control zones
         heat_map: FfHeatMap = FfHeatMap(game, self.my_team)
@@ -415,54 +495,133 @@ class RiskBot(ProcBot):
         heat_map.add_players_moved(game, BotHelper.get_players(game, self.my_team, include_own=True, include_opp=False, only_used=True))
         self.heat_map = heat_map
 
+        current_ball_control = BotHelper.ball_control_value_at_square(game, heat_map, game.get_ball_position(), game.active_team)
+        bonus_marks: List[Tuple[m.Player, m.Square]] = [] # target this player but not from this square
+
         all_actions: List[ActionSequence] = []
+
+        # analyze blitzes first to see if ball carrier can be hit
+        if any(ele.action_type == t.ActionType.START_BLITZ for ele in game.state.available_actions):
+            players_available: List[m.Player] = next(x for x in game.state.available_actions if x.action_type == t.ActionType.START_BLITZ).players
+            ball_player_blitz_strengths: dict[m.Player, int] = {}
+            ball_player_blitz_paths: dict[m.Player, list[Path]] = {}
+            best_ball_blitz_str = -3
+            for player in players_available:
+                paths = pf.get_all_paths(game, player, blitz=True)
+                turnover_cost = BotHelper.turnover_chance_penalty(game, 1, num_unmoved, True, None, player, self.variant)
+                for path in paths:
+                    # trim futile paths
+                    if player.team.state.turn != 8 and turnover_cost * (1-path.prob) < -150:
+                        continue
+
+                    if game.get_player_at(path.get_last_step()) is None:
+                        continue
+
+               #     if game.get_ball_position() == path.get_last_step():
+               #         from_position = path.steps[-2] if len(path.steps)>1 else player.position
+               #         str_diff = BotHelper.num_strength_difference_at(game, player, game.get_player_at(path.get_last_step()), from_position, True)
+               #         if not player in ball_player_blitz_strengths or str_diff > ball_player_blitz_strengths[player]:
+               #             ball_player_blitz_strengths[player] = str_diff
+               #             ball_player_blitz_paths[player] = [path]
+               #         elif str_diff == ball_player_blitz_strengths[player]:
+               #             ball_player_blitz_paths[player].extend(path)
+               #         if ball_player_blitz_strengths[player] > best_ball_blitz_str:
+               #             best_ball_blitz_str = ball_player_blitz_strengths[player]   
+            
+                    all_actions.extend(BotHelper.potential_blitz_actions(game, heat_map, player, path, num_unmoved, self.variant))
+
+            # examine blitzes on ball carrier
+            if best_ball_blitz_str >= -1 and best_ball_blitz_str <= 0:  # removing an assist will help
+                defender = game.get_ball_carrier()
+                for blitzer in ball_player_blitz_strengths.keys():
+                    if ball_player_blitz_strengths[blitzer] < best_ball_blitz_str:
+                        continue
+                    for path in ball_player_blitz_paths[blitzer]:
+                        from_position = path.steps[-2] if len(path.steps)>1 else blitzer.position
+                        assisters = BotHelper.cancelable_assists_at(game, blitzer, defender, from_position)
+                        for target in assisters:
+                            bonus_marks.extend([target, from_position])
+
+        #analyze other types
         for action_choice in game.state.available_actions:
-            if action_choice.action_type == t.ActionType.START_MOVE:
+            if action_choice.action_type == t.ActionType.START_BLITZ:
+                continue    # already covered above
+            elif action_choice.action_type == t.ActionType.START_MOVE:
                 players_available: List[m.Player] = action_choice.players
                 for player in players_available:
                     paths = paths_own[player]
-                    do_nothing_score = BotHelper.do_nothing_score(game, heat_map, player, self.variant)
-                    all_actions.extend(BotHelper.potential_move_actions(game, heat_map, player, paths, num_unmoved, do_nothing_score))
-            elif action_choice.action_type == t.ActionType.START_BLITZ:
-                players_available: List[m.Player] = action_choice.players
-                for player in players_available:
-                    paths = pf.get_all_paths(game, player, blitz=True)
-                    for path in paths:
-                        if game.get_player_at(path.get_last_step()) is None:
-                            continue
-                        all_actions.extend(BotHelper.potential_blitz_actions(game, heat_map, player, path, num_unmoved))
+                    do_nothing_score = BotHelper.do_nothing_score(game, heat_map, player, self.variant, current_ball_control)
+                    all_actions.extend(BotHelper.potential_move_actions(game, heat_map, player, paths, num_unmoved, do_nothing_score, self.variant, False, current_ball_control, bonus_marks))
             elif action_choice.action_type == t.ActionType.START_FOUL:
                 players_available: List[m.Player] = action_choice.players
                 for player in players_available:
                     paths = paths_own[player]
-                    all_actions.extend(BotHelper.potential_foul_actions(game, heat_map, player, paths, num_unmoved))
+                    all_actions.extend(BotHelper.potential_foul_actions(game, heat_map, player, paths, num_unmoved, self.variant))
             elif action_choice.action_type == t.ActionType.START_BLOCK:
                 players_available: List[m.Player] = action_choice.players
                 for player in players_available:
-                    all_actions.extend(BotHelper.potential_block_actions(game, heat_map, player, num_unmoved))
+                    all_actions.extend(BotHelper.potential_block_actions(game, heat_map, player, num_unmoved, self.variant))
             elif action_choice.action_type == t.ActionType.START_PASS:
                 players_available: List[m.Player] = action_choice.players
                 for player in players_available:
                     player_square: m.Square = player.position
                     if game.get_ball_position() == player_square:
                         paths = paths_own[player]
-                        all_actions.extend(BotHelper.potential_pass_actions(game, heat_map, player, paths, num_unmoved))
+                        all_actions.extend(BotHelper.potential_pass_actions(game, heat_map, player, paths, num_unmoved, self.variant, current_ball_control))
             elif action_choice.action_type == t.ActionType.START_HANDOFF:
                 players_available: List[m.Player] = action_choice.players
                 for player in players_available:
                     player_square: m.Square = player.position
                     if game.get_ball_position() == player_square:
                         paths = paths_own[player]
-                        all_actions.extend(BotHelper.potential_handoff_actions(game, heat_map, player, paths, num_unmoved))
+                        all_actions.extend(BotHelper.potential_handoff_actions(game, heat_map, player, paths, num_unmoved, self.variant))
             elif action_choice.action_type == t.ActionType.END_TURN:
                 all_actions.extend(BotHelper.potential_end_turn_action(game))
 
         if all_actions:
-            all_actions.sort(key=lambda x: x.score, reverse=True)
 
-            f = [x.score for x in all_actions]
+            # actions have immediate score and potential score if I wait
+            # need to look at best actions per player since taking action will use up that player
+            # look at highest immediate score per player and highest delayed score
+            # assign fractional weight to all delayed score improvements and take the action which has the highest
+            # immediate score weight + fraction of all improvements for all other players
 
-            found = False
+            # all_actions.sort(key=lambda x: x.score, reverse=True)
+
+            best_move = None
+            sum_improvement = 0.0
+            highest_i_score = 0
+            if True:
+                fraction_realized = 0 if num_unmoved == 0 else 1.0
+
+                highest_score = -9999
+                for player in players_to_move:
+                    max_i = max((action.immediate_score for action in all_actions if action.player == player), default=0)
+                    if max_i < 1.1:
+                        continue
+                    if max_i > highest_i_score:
+                        highest_i_score = max_i
+                    i_move = next((x for x in all_actions if x.player == player and x.immediate_score == max_i), None)
+                    if not BotHelper.is_do_nothing(i_move):
+                        max_d = max(action.delayed_score for action in all_actions if action.player == player)
+                        # d_move = next((x for x in all_actions if x.player == player and x.delayed_score == max_d), None)
+                        improvement = (max_d-max_i) * fraction_realized
+                        sum_improvement += improvement
+                        score = max_i - improvement  # giving up my improvement which will be included in total
+                        if score > highest_score:
+                            highest_score = score
+                            best_move = i_move
+
+                if highest_score < 1.1 - sum_improvement:  # only do this if I'm better than ending turn.
+                    best_move = None
+
+            found = best_move != None
+            if not found:
+                all_actions.sort(key=lambda x: x.immediate_score, reverse=True)  # do old method
+
+            if best_move is not None and best_move.immediate_score < highest_i_score:
+                sys.stdout.write("Giving up " + str(highest_i_score) + " for hope of " + str(sum_improvement + fraction_realized * (best_move.immediate_score - best_move.delayed_score)) + "; ")
+
             while not found:
                 best_move = all_actions.pop(0)
                 if BotHelper.is_do_nothing(best_move):
@@ -474,9 +633,9 @@ class RiskBot(ProcBot):
 
             self.current_move = best_move
             if self.verbose:
-                print('   Turn=H' + str(game.state.half) + 'R' + str(game.state.round) + ', Home=' + str(game.is_home_team(game.active_team)) + ', Action=' + self.current_move.description + ', Score=' + str(self.current_move.score))
+                print('   ' + str(num_unmoved) + ' Turn=H' + str(game.state.half) + 'R' + str(game.state.round) + ', Home=' + str(game.is_home_team(game.active_team)) + ', Action=' + self.current_move.description + ', Score=' + str(self.current_move.immediate_score))
 
-    def set_continuation_move(self, game: g.Game, num_unmoved):
+    def set_continuation_move(self, game: g.Game, num_unmoved, current_ball_control: float):
         """ Set self.current_move
 
         :param game:
@@ -485,25 +644,23 @@ class RiskBot(ProcBot):
 
         player: m.Player = game.state.active_player
         paths = pf.get_all_paths(game, player, blitz=False)
-        do_nothing_score = BotHelper.do_nothing_score(game, self.heat_map, player, self.variant)
+        do_nothing_score = BotHelper.do_nothing_score(game, self.heat_map, player, self.variant, current_ball_control)
 
         all_actions: List[ActionSequence] = []
         for action_choice in game.state.available_actions:
             if action_choice.action_type == t.ActionType.MOVE:
                 players_available: List[m.Player] = action_choice.players
-                all_actions.extend(BotHelper.potential_move_actions(game, self.heat_map, player, paths, num_unmoved, do_nothing_score, is_continuation=True))
+                all_actions.extend(BotHelper.potential_move_actions(game, self.heat_map, player, paths, num_unmoved, do_nothing_score, self.variant, True, current_ball_control, None))
             elif action_choice.action_type == t.ActionType.END_PLAYER_TURN:
                 all_actions.extend(BotHelper.potential_end_player_turn_action(game, self.heat_map, player))
 
         if all_actions:
-            all_actions.sort(key=lambda x: x.score, reverse=True)
-
-            f = [x.score for x in all_actions]
+            all_actions.sort(key=lambda x: x.immediate_score, reverse=True)
 
             self.current_move = all_actions[0]
 
             if self.verbose:
-                print('   Turn=H' + str(game.state.half) + 'R' + str(game.state.round) + ', Home=' + str(game.is_home_team(game.active_team)) + ', Action=Continue Move + ' + self.current_move.description + ', Score=' + str(self.current_move.score))
+                print('   ' + str(num_unmoved) + ' Turn=H' + str(game.state.half) + 'R' + str(game.state.round) + ', Home=' + str(game.is_home_team(game.active_team)) + ', Action=Continue Move + ' + self.current_move.description + ', Score=' + str(self.current_move.immediate_score))
 
     def turn(self, game: g.Game) -> m.Action:
         """
@@ -536,7 +693,7 @@ class RiskBot(ProcBot):
         """
         if self.current_move is None or self.current_move.is_empty():
              num_unmoved = BotHelper.get_num_unmoved(game, game.active_team)
-             self.set_continuation_move(game, num_unmoved)
+             self.set_continuation_move(game, num_unmoved, 0)
 
         action_step = self.current_move.popleft()
         return action_step
@@ -575,12 +732,12 @@ class RiskBot(ProcBot):
                 m.Action(action_choice.action_type)
                 ]
             score = BotHelper.block_favourability(action_choice.action_type, self.my_team, active_player, attacker, defender, favor)
-            actions.append(ActionSequence(action_steps, score=score, description='Block die choice'))
+            actions.append(ActionSequence(action_steps, i_score=score, player=active_player, description='Block die choice'))
 
-        if check_reroll and BotHelper.check_reroll_block(game, self.my_team, actions, favor):
+        if check_reroll and BotHelper.check_reroll_block_unused(game, self.my_team, actions, favor):
             return m.Action(t.ActionType.USE_REROLL)
         else:
-            actions.sort(key=lambda x: x.score, reverse=True)
+            actions.sort(key=lambda x: x.immediate_score, reverse=True)
             current_move = actions[0]
             return current_move.action_steps[0]
 
@@ -595,7 +752,7 @@ class RiskBot(ProcBot):
         is_blitz_action = block_proc.blitz
         score: float = -100.0
         for to_square in game.state.available_actions[0].positions:
-            cur_score = BotHelper.score_push(game, defender.position, to_square)
+            cur_score = BotHelper.score_push(game, defender.position, to_square, self.rnd)
             if cur_score > score:
                 score = cur_score
                 push_square = to_square
@@ -664,10 +821,11 @@ class RiskBot(ProcBot):
 
 class ActionSequence:
 
-    def __init__(self, action_steps: List[m.Action], player: m.Player = None, score: float = 0, description: str = ''):
+    def __init__(self, action_steps: List[m.Action], player: m.Player = None, i_score: float = 0, d_score: float = 0, description: str = ''):
         """ Creates a new ActionSequence - an ordered list of sequential Actions to attempt to undertake.
         :param action_steps: Sequence of action steps that form this action.
         :param score: A score representing the attractiveness of the move (default: 0)
+        :   immediate score is value right now, delay is value if I can wait
         :param description: A debug string (default: '')
         """
 
@@ -676,7 +834,8 @@ class ActionSequence:
         # lis
 
         self.action_steps = action_steps
-        self.score = score
+        self.immediate_score = i_score
+        self.delayed_score = d_score
         self.description = description
         self.player = player
 
@@ -750,6 +909,8 @@ class FfHeatMap:
 
         if opponent_heat < 0.4:
             score -= 80.0
+        else:
+            score += min(3, opponent_heat) * 10
         # if opponent_friendly > opponent_heat: score -= max(30.0, 10.0*(opponent_friendly-opponent_heat))
         # if opponent_heat <1.5: score -=5
         # if opponent_heat > opponent_friendly: score += 10.0*(opponent_friendly-opponent_heat)
@@ -955,14 +1116,14 @@ class BotHelper:
         return abs(player1.position.x - player2.position.x) == abs(player1.position.y - player2.position.y)
 
     @staticmethod
-    def attacker_would_surf(game: g.Game, attacker: m.Player, defender: m.Player) -> bool:
+    def attacker_would_surf(game: g.Game, attacker: m.Player, defender: m.Player, attacker_position) -> bool:
         if (defender.has_skill(t.Skill.SIDE_STEP) and not attacker.has_skill(t.Skill.GRAB)) or defender.has_skill(t.Skill.STAND_FIRM):
             return False
 
-        if not attacker.position.is_adjacent(defender.position):
+        if not attacker_position.is_adjacent(defender.position):
             return False
 
-        return BotHelper.direct_surf_squares(game, attacker.position, defender.position)
+        return BotHelper.direct_surf_squares(game, attacker_position, defender.position)
 
     @staticmethod
     def direct_surf_squares(game: g.Game, attack_square: m.Square, defend_square: m.Square) -> bool:
@@ -1227,7 +1388,7 @@ class BotHelper:
             m.Action(t.ActionType.END_PLAYER_TURN)
             ]
         # End turn happens on a score of 1.0.  Any actions with a lower score are never selected.
-        actions.append(ActionSequence(action_steps, score=1.0, description='End Turn', player=player))
+        actions.append(ActionSequence(action_steps, i_score=1.0, description='End Turn', player=player))
         return actions
 
     @staticmethod
@@ -1237,11 +1398,11 @@ class BotHelper:
             m.Action(t.ActionType.END_TURN)
             ]
         # End turn happens on a score of 1.0.  Any actions with a lower score are never selected.
-        actions.append(ActionSequence(action_steps, score=1.0, description='End Turn'))
+        actions.append(ActionSequence(action_steps, i_score=1.0, description='End Turn'))
         return actions
 
     @staticmethod
-    def potential_block_actions(game: g.Game, heat_map: FfHeatMap, player: m.Player, num_unmoved) -> List[ActionSequence]:
+    def potential_block_actions(game: g.Game, heat_map: FfHeatMap, player: m.Player, num_unmoved, variant: bool) -> List[ActionSequence]:
 
         # Note to self: need a "stand up and end move option.
         move_actions: List[ActionSequence] = []
@@ -1256,10 +1417,9 @@ class BotHelper:
                 m.Action(t.ActionType.END_PLAYER_TURN)
             ]
 
-            action_score = BotHelper.score_block(game, heat_map, player, blockable_player)
-            score = action_score
+            score_pair = BotHelper.score_block(game, heat_map, player, blockable_player, variant, num_unmoved)
 
-            move_actions.append(ActionSequence(action_steps, score=score, description='Block ' + player.name + ' to (' + str(blockable_player.position.x) + ',' + str(blockable_player.position.y) + ')', player=player))
+            move_actions.append(ActionSequence(action_steps, i_score=score_pair[0], d_score=score_pair[1], description='Block ' + player.name + ' to (' + str(blockable_player.position.x) + ',' + str(blockable_player.position.y) + ')', player=player))
             # potential action -> sequence of steps such as "START_MOVE, MOVE (to square) etc
         return move_actions
 
@@ -1318,27 +1478,35 @@ class BotHelper:
             return actions
         
     @staticmethod
-    def potential_blitz_actions(game: g.Game, heat_map: FfHeatMap, player: m.Player, path: pf.Path, num_unmoved) -> List[ActionSequence]:
+    def potential_blitz_actions(game: g.Game, heat_map: FfHeatMap, player: m.Player, path: pf.Path, num_unmoved, variant: bool) -> List[ActionSequence]:
         move_actions: List[ActionSequence] = []     
         from_position = path.steps[-2] if len(path.steps)>1 else player.position
         to_square = path.steps[-1]
 
-        action_score = BotHelper.score_blitz(game, heat_map, player, from_position, game.get_player_at(to_square))
-        path_score = BotHelper.path_cost_to_score(path, num_unmoved, player)  # If an extra GFI required for block, should increase here.  To do.
-        score = action_score + path_score
+        score_pair = BotHelper.score_blitz(game, heat_map, player, from_position, game.get_player_at(to_square), variant, num_unmoved)
+        path_score = BotHelper.path_cost_to_score(game, path, num_unmoved, to_square if game.has_ball(player) else None, player, variant)  # If an extra GFI required for block, should increase here.  To do.
+        i_score = score_pair[0]
+        d_score = score_pair[1]
+        i_score += path_score
+        d_score += path_score + (1-path.prob) * num_unmoved * -RiskBot.BASE_SCORE_TURNOVER_UNMOVED_PLAYER
 
         action_steps: List[Action] = []
         action_steps.append(Action(ActionType.START_BLITZ, player=player))
         action_steps.extend(BotHelper.path_to_move_actions(game, player, path))
-        move_actions.append(ActionSequence(action_steps, score=score, description='Blitz ' + player.name + ' to ' + str(to_square.x) + ',' + str(to_square.y), player=player))
+        move_actions.append(ActionSequence(action_steps, i_score=i_score, d_score=d_score, description='Blitz ' + player.name + ' to ' + str(to_square.x) + ',' + str(to_square.y), player=player))
 
         # potential action -> sequence of steps such as "START_MOVE, MOVE (to square) etc
         return move_actions
 
     @staticmethod
-    def potential_pass_actions(game: g.Game, heat_map: FfHeatMap, player: m.Player, paths: List[pf.Path], num_unmoved) -> List[ActionSequence]:
+    def potential_pass_actions(game: g.Game, heat_map: FfHeatMap, player: m.Player, paths: List[pf.Path], num_unmoved, variant: bool, current_ball_control: float) -> List[ActionSequence]:
         move_actions: List[ActionSequence] = []
+        turnover_cost = BotHelper.turnover_chance_penalty(game, 1, num_unmoved, True, None, player, variant)
         for path in paths:
+            # trim futile paths
+            if player.team.state.turn != 8 and turnover_cost * (1-path.prob) < -200:
+                continue
+
             path_steps = path.steps
             end_square: m.Square = game.get_square(path.get_last_step().x, path.get_last_step().y)
             # Need possible receving players
@@ -1358,18 +1526,29 @@ class BotHelper:
                 action_steps.append(m.Action(t.ActionType.PASS, position=to_square))
                 action_steps.append(m.Action(t.ActionType.END_PLAYER_TURN))
 
-                action_score = BotHelper.score_pass(game, heat_map, player, end_square, to_square)
-                path_score = BotHelper.path_cost_to_score(path, num_unmoved, player)  # If an extra GFI required for block, should increase here.  To do.
-                score = action_score + path_score
+                score_pair = BotHelper.score_pass(game, heat_map, player, end_square, to_square, variant, current_ball_control)
+                path_score = BotHelper.path_cost_to_score(game, path, num_unmoved, to_square, player, variant)  # If an extra GFI required for block, should increase here.  To do.
+                i_score = score_pair[0]
+                d_score = score_pair[1]
+                i_score += path_score
+                d_score += path_score
+                if num_unmoved > 0:
+                    pass_failure = (d_score-i_score) / (num_unmoved * -RiskBot.BASE_SCORE_TURNOVER_UNMOVED_PLAYER)
+                    d_score += (1-pass_failure) * (1-path.prob) * num_unmoved * -RiskBot.BASE_SCORE_TURNOVER_UNMOVED_PLAYER
 
-                move_actions.append(ActionSequence(action_steps, score=score, description='Pass ' + player.name + ' to ' + str(to_square.x) + ',' + str(to_square.y), player=player))
+                move_actions.append(ActionSequence(action_steps, i_score=i_score, d_score=d_score, description='Pass ' + player.name + ' to ' + str(to_square.x) + ',' + str(to_square.y), player=player))
                 # potential action -> sequence of steps such as "START_MOVE, MOVE (to square) etc
         return move_actions
 
     @staticmethod
-    def potential_handoff_actions(game: g.Game, heat_map: FfHeatMap, player: m.Player, paths: List[pf.Path], num_unmoved) -> List[ActionSequence]:
+    def potential_handoff_actions(game: g.Game, heat_map: FfHeatMap, player: m.Player, paths: List[pf.Path], num_unmoved, variant: bool) -> List[ActionSequence]:
         move_actions: List[ActionSequence] = []
+        turnover_cost = BotHelper.turnover_chance_penalty(game, 1, num_unmoved, True, None, player, variant)
         for path in paths:
+            # trim futile paths
+            if player.team.state.turn != 8 and turnover_cost * (1-path.prob) < -200:
+                continue
+
             path_steps = path.steps
             end_square: m.Square = game.get_square(path.get_last_step().x, path.get_last_step().y)
             handoffable_players = game.get_adjacent_players(end_square, team=player.team, standing=True, down=False, stunned=False)
@@ -1383,18 +1562,29 @@ class BotHelper:
                 action_steps.append(m.Action(t.ActionType.HANDOFF, position=handoffable_player.position))
                 action_steps.append(m.Action(t.ActionType.END_PLAYER_TURN))
 
-                action_score = BotHelper.score_handoff(game, heat_map, player, handoffable_player, end_square)
-                path_score = BotHelper.path_cost_to_score(path, num_unmoved, player)  # If an extra GFI required for block, should increase here.  To do.
-                score = action_score + path_score
+                score_pair = BotHelper.score_handoff(game, heat_map, player, handoffable_player, end_square, variant)
+                path_score = BotHelper.path_cost_to_score(game, path, num_unmoved, end_square, player, variant)  # If an extra GFI required for block, should increase here.  To do.
+                i_score = score_pair[0]
+                d_score = score_pair[1]
+                i_score += path_score
+                d_score += path_score
+                if num_unmoved > 0:
+                    pass_failure = (d_score-i_score) / (num_unmoved * -RiskBot.BASE_SCORE_TURNOVER_UNMOVED_PLAYER)
+                    d_score += (1-pass_failure) * (1-path.prob) * num_unmoved * -RiskBot.BASE_SCORE_TURNOVER_UNMOVED_PLAYER
 
-                move_actions.append(ActionSequence(action_steps, score=score, description='Handoff ' + player.name + ' to ' + str(handoffable_player.position.x) + ',' + str(handoffable_player.position.y), player=player))
+                move_actions.append(ActionSequence(action_steps, i_score=i_score, d_score=d_score, description='Handoff ' + player.name + ' to ' + str(handoffable_player.position.x) + ',' + str(handoffable_player.position.y), player=player))
                 # potential action -> sequence of steps such as "START_MOVE, MOVE (to square) etc
         return move_actions
 
     @staticmethod
-    def potential_foul_actions(game: g.Game, heat_map: FfHeatMap, player: m.Player, paths: List[pf.Path], num_unmoved) -> List[ActionSequence]:
+    def potential_foul_actions(game: g.Game, heat_map: FfHeatMap, player: m.Player, paths: List[pf.Path], num_unmoved, variant: bool) -> List[ActionSequence]:
         move_actions: List[ActionSequence] = []
+        turnover_cost = BotHelper.turnover_chance_penalty(game, 1, num_unmoved, True, None, player, variant)
         for path in paths:
+            # trim futile paths
+            if player.team.state.turn != 8 and turnover_cost * (1-path.prob) < -100:
+                continue
+
             path_steps = path.steps
             end_square: m.Square = game.get_square(path.get_last_step().x, path.get_last_step().y)
             foulable_players = game.get_adjacent_players(end_square, team=game.get_opp_team(player.team),  standing=False, stunned=True, down=True)
@@ -1410,46 +1600,80 @@ class BotHelper:
                 action_steps.append(m.Action(t.ActionType.FOUL, foulable_player.position))
                 action_steps.append(m.Action(t.ActionType.END_PLAYER_TURN))
 
-                action_score = BotHelper.score_foul(game, heat_map, player, foulable_player, end_square)
-                path_score = BotHelper.path_cost_to_score(path, num_unmoved, player)  # If an extra GFI required for block, should increase here.  To do.
+                action_score = BotHelper.score_foul(game, heat_map, player, foulable_player, end_square, num_unmoved, variant)
+                path_score = BotHelper.path_cost_to_score(game, path, num_unmoved, end_square if game.has_ball(player) else None, player, variant)  # If an extra GFI required for block, should increase here.  To do.
                 score = action_score + path_score
 
-                move_actions.append(ActionSequence(action_steps, score=score, description='Foul ' + player.name + ' to ' + str(foulable_player.position.x) + ',' + str(foulable_player.position.y), player=player))
+                i_score = action_score + path_score
+                # fails 16.67% if path succeeds
+                failure = 0 if player.has_skill(g.Skill.SNEAKY_GIT) else 0.1667
+                d_score = i_score + failure * path.prob * num_unmoved * -RiskBot.BASE_SCORE_TURNOVER_UNMOVED_PLAYER
+                d_score += (1-path.prob) * num_unmoved * -RiskBot.BASE_SCORE_TURNOVER_UNMOVED_PLAYER
+
+                move_actions.append(ActionSequence(action_steps, i_score=i_score, d_score=d_score, description='Foul ' + player.name + ' to ' + str(foulable_player.position.x) + ',' + str(foulable_player.position.y), player=player))
                 # potential action -> sequence of steps such as "START_MOVE, MOVE (to square) etc
         return move_actions
 
     @staticmethod
-    def do_nothing_score(game: g.Game, heat_map: FfHeatMap, player: m.Player, variant: bool) -> float:
+    def do_nothing_score(game: g.Game, heat_map: FfHeatMap, player: m.Player, variant: bool, current_ball_control: float) -> float:
         do_nothing_score = 0
-        if variant and player.has_tackle_zone():
-            do_nothing_score, is_complete, description = BotHelper.score_move(game, heat_map, player, player.position, 1)
+        if player.has_tackle_zone():
+            do_nothing_score, is_complete, description = BotHelper.score_move(game, heat_map, player, player.position, 1, current_ball_control, None)
             if BotHelper.distance_to_sideline(game, player.position) == 0:
-                do_nothing_score -= 30
+                do_nothing_score -= 40
             elif BotHelper.distance_to_sideline(game, player.position) == 1 and game.num_tackle_zones_in(player) > 0:
                 do_nothing_score -= 20
             if do_nothing_score < 0:
                 do_nothing_score = 0
+            ball_carrier = game.get_ball_carrier()
+            if ball_carrier is not None and ball_carrier.team == player.team and player.position.distance(ball_carrier.position) <= 2:
+                if heat_map.units_opponent[player.position.x][player.position.y] > 0.4:
+                    do_nothing_score += 20
+                    ball_square = ball_carrier.position
+                    cage_square_groups: List[List[m.Square]] = [
+                        BotHelper.caging_squares_north_east(game, ball_square),
+                        BotHelper.caging_squares_north_west(game, ball_square),
+                        BotHelper.caging_squares_south_east(game, ball_square),
+                        BotHelper.caging_squares_south_west(game, ball_square)
+                        ]
+                    for group in cage_square_groups:
+                        if player.position in group:
+                            required = True
+                            for square in group:
+                                if square != player.position and game.get_player_at(square) is not None:
+                                    other = game.get_player_at(square)
+                                    if other.team == player.team and other.can_assist():
+                                        required = False
+                                        break
+                            if required:
+                                do_nothing_score += 60
+                            break
+
         return do_nothing_score
 
-    def potential_move_actions(game: g.Game, heat_map: FfHeatMap, player: m.Player, paths: List[pf.Path], num_unmoved, do_nothing_score: float, is_continuation: bool = False) -> List[ActionSequence]:
+    def potential_move_actions(game: g.Game, heat_map: FfHeatMap, player: m.Player, paths: List[pf.Path], num_unmoved, do_nothing_score: float, variant: bool, is_continuation: bool, current_ball_control: float, bonus_marks: List[Tuple[m.Player, m.Square]]) -> List[ActionSequence]:
         move_actions: List[ActionSequence] = []
         ball_square: m.Square = game.get_ball_position()
+        turnover_cost = BotHelper.turnover_chance_penalty(game, 1, num_unmoved, True, None, player, variant)
         if not player.has_tackle_zone():
             # consider standing and doing nothing
             action_steps: List[m.Action] = []
             action_steps.append(m.Action(t.ActionType.START_MOVE, player=player))
             action_steps.append(m.Action(t.ActionType.STAND_UP))
             action_steps.append(m.Action(t.ActionType.END_PLAYER_TURN))
-            score, is_complete, description = BotHelper.score_move(game, heat_map, player, player.position, 1)
+            score, is_complete, description = BotHelper.score_move(game, heat_map, player, player.position, 1, current_ball_control, bonus_marks)
             if BotHelper.distance_to_sideline(game, player.position) == 0:
-                score -= 30
+                score = -1
             elif BotHelper.distance_to_sideline(game, player.position) == 1 and game.num_tackle_zones_in(player) > 0:
                 score -= 20
-            score -= do_nothing_score
-            action = ActionSequence(action_steps, score=score, description=f'''Stand Up: {description} {player.name} {player.position.x}, {player.position.y}''', player=player)
+            action = ActionSequence(action_steps, i_score=score, d_score=score, description=f'''Stand Up: {description} {player.name} {player.position.x}, {player.position.y}''', player=player)
             move_actions.append(action)
 
         for path in paths:
+            # trim futile paths
+            if player.team.state.turn != 8 and turnover_cost * (1-path.prob) < -100:
+                continue
+
             path_steps = path.steps
             action_steps: List[m.Action] = []
             if not is_continuation:
@@ -1465,33 +1689,87 @@ class BotHelper:
                 action_steps.append(m.Action(t.ActionType.MOVE, position=step))
 
             to_square: m.Square = path.get_last_step()
-            action_score, is_complete, description = BotHelper.score_move(game, heat_map, player, to_square, path.prob)
+            action_score, is_complete, description = BotHelper.score_move(game, heat_map, player, to_square, path.prob, current_ball_control, bonus_marks)
             if is_complete:
                 action_steps.append(m.Action(t.ActionType.END_PLAYER_TURN))
 
             if is_continuation:
                 # Continuing actions (after a Blitz block for example) may choose risky options, so penalise risk
-                path_score = BotHelper.continuation_path_cost_to_score(path, num_unmoved, player)
+                path_score = BotHelper.continuation_path_cost_to_score(game, path, num_unmoved, to_square if game.has_ball(player) else None, player, variant)
 
             else:
-                path_score = BotHelper.path_cost_to_score(path, num_unmoved, player)
+                path_score = BotHelper.path_cost_to_score(game, path, num_unmoved, to_square if game.has_ball(player) else None, player, variant)
 
             # if I'm moving to ball, I need to back out pickup failure score with high risk penalty and put it back in at low penalty
             if (to_square == ball_square and game.get_ball_carrier() is None):
                 pickup_fail = 1.0 - game.get_pickup_prob(player, ball_square, allow_team_reroll=True)
-                path_score -= BotHelper.turnover_chance_penalty(pickup_fail, num_unmoved, True, player)
-                path_score += BotHelper.turnover_chance_penalty(pickup_fail, num_unmoved, False, player)
+                path_score -= BotHelper.turnover_chance_penalty(game, pickup_fail, num_unmoved, True, ball_square, player, variant)
+                path_score += BotHelper.turnover_chance_penalty(game, pickup_fail, num_unmoved, False, ball_square, player, variant)
 
-            score = action_score + path_score
-            score -= do_nothing_score
-            action = ActionSequence(action_steps, score=score, description=f'''Move: {description} {player.name} {player.position.x}, {player.position.y} to {path.get_last_step().x}, {path.get_last_step().y}''', player=player)
+            i_score = action_score + path_score
+            i_score -= do_nothing_score
+            d_score = i_score + (1-path.prob) * num_unmoved * -RiskBot.BASE_SCORE_TURNOVER_UNMOVED_PLAYER
+
+            action = ActionSequence(action_steps, i_score=i_score, d_score=d_score, description=f'''Move: {description} {player.name} {player.position.x}, {player.position.y} to {path.get_last_step().x}, {path.get_last_step().y}''', player=player)
 
             move_actions.append(action)
             # potential action -> sequence of steps such as "START_MOVE, MOVE (to square) etc
         return move_actions
 
     @staticmethod
-    def score_blitz(game: g.Game, heat_map: FfHeatMap, attacker: m.Player, block_from_square: m.Square, defender: m.Player) -> float:
+    def num_strength_difference_at(game: g.Game, attacker, defender, position: Square, blitz: bool):
+        """
+        :param attacker:
+        :param defender:
+        :param position: attackers position
+        :param blitz: if it is a blitz
+        :param dauntless_success: If a dauntless rolls was successful.
+        :return: The number of block dice used in a block between the attacker and defender if the attacker block at
+                 the given position.
+        """
+
+        # Determine dice and favor
+        st_for = attacker.get_st()
+        st_against = defender.get_st()
+
+        # Horns
+        if blitz and attacker.has_skill(Skill.HORNS):
+            st_for += 1
+
+        # Find assists
+        assists_for, assists_against = game.num_assists_at(attacker, defender, position, foul=False)
+
+        st_for = st_for + assists_for
+        st_against = st_against + assists_against
+
+        return st_for - st_against
+
+    @staticmethod
+    def cancelable_assists_at(game: g.Game, attacker: m.Player, defender: m.Player, position: Square) -> List[m.Player]:
+        '''
+        Return list of opponents that are assisting defender but can be canceled
+        '''
+
+        # Note that because blitzing player may have moved,
+        # calculating assists for is slightly different to against.
+        # Assists against
+        opp_assisters = game.get_adjacent_players(position, team=game.get_opp_team(attacker.team), down=False)
+        opp_assisters = list(filter(lambda obj: obj != defender and obj.can_assist() and not obj.has_skill(Skill.GUARD), opp_assisters))
+        for assister in list(opp_assisters):
+            # Check if in a tackle zone of anyone besides player (at either original square, or "position")
+            adjacent_to_assisters = game.get_adjacent_opponents(assister, down=False)
+            for adjacent_to_assister in adjacent_to_assisters:
+                # Need to make sure we take into account the blocking/blitzing player may be in a different square
+                # than currently represented on the board.
+                if adjacent_to_assister.position == position or adjacent_to_assister.position == attacker.position or not adjacent_to_assister.can_assist():
+                    continue
+                else:
+                    opp_assisters.remove(assister)
+                    break
+        return opp_assisters
+
+    @staticmethod
+    def score_blitz(game: g.Game, heat_map: FfHeatMap, attacker: m.Player, block_from_square: m.Square, defender: m.Player, variant: bool, num_unmoved) -> List[float]:
         score: float = RiskBot.BASE_SCORE_BLITZ
 
         ball_carrier: Optional[m.Player] = game.get_ball_carrier()
@@ -1501,30 +1779,45 @@ class BotHelper:
         num_block_dice: int = game.num_block_dice_at(attacker, defender, block_from_square, blitz=True, dauntless_success=False)
         ball_position: m.Player = game.get_ball_position()
         if num_block_dice == 3:
-            score += 30.0
+            score += 15.0
         if num_block_dice == 2:
-            score += 10.0
+            score += 0.0
         if num_block_dice == 1:
-            score += -30.0
+            if attacker.has_skill(t.Skill.BLOCK) or attacker.has_skill(t.Skill.WRESTLE):
+                score -= 36
+            else:
+                score += -66.0  # score is close to zero.
         if num_block_dice == -2:
-            score += -75.0
+            score += -95.0
         if num_block_dice == -3:
-            score += -100.0
-        if attacker.has_skill(t.Skill.BLOCK):
+            score += -150.0
+
+        if attacker.team.state.reroll_used or attacker.has_skill(t.Skill.LONER):
+            score -= 10.0
+        if attacker.has_skill(t.Skill.BLOCK) or attacker.has_skill(t.Skill.WRESTLE):
             score += 20.0
         if defender.has_skill(t.Skill.DODGE) and not attacker.has_skill(t.Skill.TACKLE):
-            score -= 10.0
+            score += -10.0
         if defender.has_skill(t.Skill.BLOCK):
             score += -10.0
+        if attacker.has_skill(t.Skill.LONER):
+            score -= 10.0
+
+        # change score to use block base and then switch back (for purposes of judging risk)
+        score += RiskBot.BASE_SCORE_BLOCK - RiskBot.BASE_SCORE_BLITZ
+        prob_fail = max(0.0278, .3410 - 0.00369*score)
+        prob_him_down = 0.0000325*score*score + 0.002235*score + 0.1653
+        score -= RiskBot.BASE_SCORE_BLOCK - RiskBot.BASE_SCORE_BLITZ
+
+        if BotHelper.attacker_would_surf(game, attacker, defender, block_from_square):
+            score += 42.0
         if is_ball_carrier:
             if attacker.position.is_adjacent(defender.position) and block_from_square == attacker.position:
                 score += 20.0  # Favour blitzing with ball carrier at start of move
             else:
                 score += -40.0  # But don't blitz with ball carrier after that
         if defender_is_ball_carrier:
-            score += 55.0              # Blitzing ball carrier
-        else:
-            score -= 10
+            score += RiskBot.BALL_CONTROL_SCORE * prob_him_down + 50    # Blitzing ball carrier - bonus for being next to carrier
         if defender.position.is_adjacent(ball_position):
             score += 20.0   # Blitzing someone adjacent to ball carrier
         if BotHelper.direct_surf_squares(game, block_from_square, defender.position):
@@ -1534,44 +1827,89 @@ class BotHelper:
         if attacker.position == block_from_square:
             score -= 20.0   # A Blitz where the block is the starting square is unattractive
         if BotHelper.in_scoring_range(game, defender):
-            score += 10.0  # Blitzing players closer to the endzone is attractive
-        score += 16.0 - 2 * defender.get_av()
-        score += BotHelper.player_value_thousands(defender) / 5
-        score -= 10.0 + BotHelper.player_value_thousands(attacker) / 10
+            score += 8.0  # Blitzing players closer to the endzone is attractive
+
+        if score <= RiskBot.BASE_SCORE_BLITZ:
+            score -= 10     # nothing special about this - delay decision
+
+        score += BotHelper.fall_down_value(game, defender) * prob_him_down
+        score += BotHelper.turnover_chance_penalty(game, prob_fail, num_unmoved, True, block_from_square if is_ball_carrier else None, attacker, variant)
+
+        # discourage blitzing someone who can be regular blocked
+        if True in (not p.state.used for p in game.get_adjacent_opponents(attacker, stunned=False, down=False)):
+            score -= 8
 
         # encourage standing up
         if not attacker.has_tackle_zone(): score += RiskBot.ADDITIONAL_SCORE_PRONE
-        return score
+        return [score, score + num_unmoved * -RiskBot.BASE_SCORE_TURNOVER_UNMOVED_PLAYER * prob_fail]
 
     @staticmethod
-    def score_foul(game: g.Game, heat_map: FfHeatMap, attacker: m.Player, defender: m.Player, to_square: m.Square) -> float:
+    def score_foul(game: g.Game, heat_map: FfHeatMap, attacker: m.Player, defender: m.Player, to_square: m.Square, num_unmoved: int, variant: bool) -> float:
         score = RiskBot.BASE_SCORE_FOUL
         ball_carrier: Optional[m.Player] = game.get_ball_carrier()
 
-        if ball_carrier == attacker:
-            score = score - 30.0
+        assists_for, assists_against = game.num_assists_at(attacker, defender, to_square, foul=True)
         if attacker.has_skill(t.Skill.DIRTY_PLAYER):
-            score = score + 10.0
-        if attacker.has_skill(t.Skill.SNEAKY_GIT):
-            score = score + 10.0
+            assists_for += 1
+
+        prob_break = BotHelper.probability_break_armor(defender, assists_for-assists_against)
+        if attacker.has_skill(t.Skill.SNEAKY_GIT) or attacker.team.state.bribes > 0:
+            prob_fail = 0
+        else:
+            prob_fail = 0.16667
         if defender.state.stunned:
             score = score - 15.0
+        if ball_carrier == attacker:
+            score = score - 30.0
 
-        assists_for, assists_against = game.num_assists_at(attacker, defender, to_square, foul=True)
-        score = score + (assists_for-assists_against) * 15.0
+        score += prob_break * BotHelper.discounted_player_value(game, defender)
+        score -= prob_fail * BotHelper.discounted_player_value(game, attacker) * 3.6  # removed from game
+        score += BotHelper.turnover_chance_penalty(game, prob_fail, num_unmoved, False, attacker.position if ball_carrier == attacker else None, attacker, variant)
 
-        if attacker.team.state.bribes > 0:
-            score += 40.0
         if attacker.has_skill(t.Skill.CHAINSAW):
             score += 30.0
-        # TVdiff = defender.GetBaseTV() - attacker.GetBaseTV()
-        tv_diff = 10.0
-        score = score + tv_diff
 
         return score
 
     @staticmethod
-    def score_move(game: g.Game, heat_map: FfHeatMap, player: m.Player, to_square: m.Square, prob: float) -> Tuple[float, bool, str]:
+    def someone_can_2d_me_here(game: g.Game, player: m.Player, to_square: m.Square) -> bool:
+        for opponent in game.get_adjacent_players(to_square, team=game.get_opp_team(player.team),down=False):
+            if game.num_block_dice_at(player, opponent,position=to_square) <= -2:
+                return True
+        return False
+
+    @staticmethod
+    def max_heat_around_position(game: g.Game, heat_map: FfHeatMap, square: Square, opponent: bool) -> float:
+        highest = 0.0
+        for square in game.get_adjacent_squares(square):
+            heat: float = heat_map.units_opponent[square.x][square.y] if opponent else heat_map.units_friendly[square.x][square.y]
+            highest = max(highest, heat)
+        return highest
+
+    @staticmethod
+    def ball_control_value_at_square(game: g.Game, heat_map: FfHeatMap, to_square: m.Square, my_team: g.Team) -> float:
+        logit = -.32
+        ball_carrier = game.get_ball_carrier()
+        if ball_carrier is not None and ball_carrier.team != my_team:
+            logit += -2.03
+            logit += 0.357 * min(5, heat_map.units_friendly[to_square.x][to_square.y])
+        else:
+            if ball_carrier is not None:
+                logit += 0.66
+            logit += 0.386 * min(2, heat_map.units_friendly[to_square.x][to_square.y])
+            logit += 0.039 * min(2, BotHelper.max_heat_around_position(game, heat_map, to_square, False))
+            his_heat_at = heat_map.units_opponent[to_square.x][to_square.y]
+            his_heat_arround = BotHelper.max_heat_around_position(game, heat_map, to_square, True)
+            if (his_heat_at < 0.4):
+                logit += 0.191
+            if (his_heat_at >= 2.5):
+                logit += -0.259
+            if (his_heat_arround < 0.8):
+                logit += 0.308
+        return np.tanh(logit) * RiskBot.BALL_CONTROL_SCORE
+
+    @staticmethod
+    def score_move(game: g.Game, heat_map: FfHeatMap, player: m.Player, to_square: m.Square, prob: float, current_ball_control: float, bonus_marks: List[Tuple[m.Player, m.Square]]) -> Tuple[float, bool, str]:
 
         scoring_impossible = BotHelper.scoring_impossible(game)
 
@@ -1579,12 +1917,12 @@ class BotHelper:
             [0, True, ''] if scoring_impossible else [*BotHelper.score_receiving_position(game, heat_map, player, to_square), 'move to receiver'],
             [0, True, ''] if scoring_impossible else [*BotHelper.score_move_to_ball(game, heat_map, player, to_square), 'move to ball'],
             [0, True, ''] if scoring_impossible else [*BotHelper.score_move_towards_ball(game, heat_map, player, to_square), 'move toward ball'],
-            [0, True, ''] if scoring_impossible else [*BotHelper.score_move_ball(game, heat_map, player, to_square, prob), 'move ball'],
+            [0, True, ''] if scoring_impossible else [*BotHelper.score_move_ball(game, heat_map, player, to_square, prob, current_ball_control), 'move ball'],
             [0, True, ''] if scoring_impossible else [*BotHelper.score_sweep(game, heat_map, player, to_square), 'move to sweep'],
             [*BotHelper.score_defensive_screen(game, heat_map, player, to_square), 'move to defensive screen'],
             [*BotHelper.score_offensive_screen(game, heat_map, player, to_square), 'move to offsensive screen'],
             [*BotHelper.score_caging(game, heat_map, player, to_square), 'move to cage'],
-            [*BotHelper.score_mark_opponent(game, heat_map, player, to_square), 'move to mark opponent']
+            [*BotHelper.score_mark_opponent(game, heat_map, player, to_square, bonus_marks), 'move to mark opponent']
             ]
 
         scores.sort(key=lambda tup: tup[0], reverse=True)
@@ -1599,8 +1937,11 @@ class BotHelper:
         if not player.state.up:
             score += RiskBot.ADDITIONAL_SCORE_PRONE
 
-        if to_square == player.position:
-            x = 1
+        if BotHelper.someone_can_2d_me_here(game, player, to_square):
+            score -= 20
+
+        if player.team.state.turn == 8 and game.get_ball_position() == player.position and not BotHelper.in_scoring_endzone(game, player.team, to_square):
+            score -= 100
 
         return score, is_complete, description
 
@@ -1629,11 +1970,15 @@ class BotHelper:
         opps: List[m.Player] = game.get_adjacent_players(player.position, opp_team, stunned=False, down=False)
         if opps:
             score -= 40.0 + 20.0 * len(opps)
-        score -= 10.0 * len(game.get_adjacent_players(to_square, opp_team, stunned=False, down=False))
+        score -= 20.0 * len(game.get_adjacent_players(to_square, opp_team, stunned=False, down=False))
         num_in_range = len(BotHelper.players_in_scoring_range(game, player.team, include_own=True, include_opp=False))
         score -= num_in_range * num_in_range * 20.0     # Lower the score if we already have some receivers.
         if BotHelper.players_in(game, player.team, BotHelper.squares_within(game, to_square, 2), include_opp=False, include_own=True):
             score -= 20.0
+
+        # don't want to increase my danger too much
+        score += 0.5 * min(0.5 * RiskBot.BALL_CONTROL_SCORE, BotHelper.ball_control_value_at_square(game, heat_map, to_square, player.team))
+        score -= 0.5 * min(0.5 * RiskBot.BALL_CONTROL_SCORE, BotHelper.ball_control_value_at_square(game, heat_map, player.position, player.team))
 
         return score, True
 
@@ -1754,7 +2099,7 @@ class BotHelper:
         return score, False
 
     @staticmethod
-    def score_move_ball(game: g.Game, heat_map: FfHeatMap, player: m.Player, to_square: m.Square, prob: float) -> Tuple[float, bool]:
+    def score_move_ball(game: g.Game, heat_map: FfHeatMap, player: m.Player, to_square: m.Square, prob: float, current_ball_control) -> Tuple[float, bool]:
         # ball_square: m.Square = game.get_ball_position()
         ball_carrier = game.get_ball_carrier()
         if (ball_carrier is None) or player != ball_carrier:
@@ -1770,8 +2115,6 @@ class BotHelper:
                 score += 60.0  # Make scoring attractive
             score += 10 * len(game.get_adjacent_players(to_square, team=player.team, down=False))
             score += 10 * len(game.get_adjacent_players(to_square, team=player.team, diagonal=False, down=False))
-        elif player.team.state.turn == 8:
-            score -= 100.0  # If it's the last turn, heavily penalyse a non-scoring action
         else:
             score += heat_map.get_ball_move_square_safety_score(to_square)
             opps: List[m.Player] = game.get_adjacent_players(to_square, team=game.get_opp_team(player.team), stunned=False)
@@ -1785,11 +2128,13 @@ class BotHelper:
 
             dist_player = BotHelper.distance_to_scoring_endzone(game, player.team, player.position)
             dist_destination = BotHelper.distance_to_scoring_endzone(game, player.team, to_square)
-            score += 8.0 * (dist_player - dist_destination)  # Increase score the closer we get to the scoring end zone
+            score += RiskBot.BALL_POSITION_SCORE_PER_SQUARE * (dist_player - dist_destination)  # Increase score the closer we get to the scoring end zone
 
             # Try to keep the ball central
             if BotHelper.distance_to_sideline(game, to_square) < 3:
                 score -= 30
+
+        score += BotHelper.ball_control_value_at_square(game, heat_map, to_square, player.team) - current_ball_control
 
         return score, True
 
@@ -1881,7 +2226,7 @@ class BotHelper:
             distance_to_ball = ball_square.distance(to_square)
             score += 4.0*max(5.0 - distance_to_ball, 0.0)  # Increase score defending in front of ball carrier
 
-            score -= 1.0 * (abs(ball_square.y - to_square.y))  # Penalise for defending away from directly in front of ball
+            score -= 2.0 * (abs(ball_square.y - to_square.y))  # Penalise for defending away from directly in front of ball
 
             score += distance_square_to_end/10.0  # Increase score a small amount to screen closer to opponents.
 
@@ -1917,7 +2262,7 @@ class BotHelper:
 
         ball_carrier: m.Player = game.get_ball_carrier()
         ball_square: m.Player = game.get_ball_position()
-        if ball_carrier is None or ball_carrier.team != player.team:
+        if ball_carrier is None or ball_carrier.team != player.team or ball_carrier == player:
             return 0.0, True
 
         score = 0.0     # Placeholder - not implemented yet.
@@ -1935,6 +2280,13 @@ class BotHelper:
         if game.get_opp_team(player.team).state.turn == 8:
             return 0.0, True    # other team has no moves
         ball_square: m.Square = game.get_ball_position()
+        score = RiskBot.BASE_SCORE_CAGE_BALL
+
+        # am I already caging?
+        if BotHelper.is_adjacent_ball(game, player.position):
+            if heat_map.units_opponent[to_square.x][to_square.y] < heat_map.units_opponent[player.position.x][player.position.y] + 0.1:
+                return 0, True
+            score -= 5
 
         cage_square_groups: List[List[m.Square]] = [
             BotHelper.caging_squares_north_east(game, ball_square),
@@ -1949,10 +2301,8 @@ class BotHelper:
         for curGroup in cage_square_groups:
             if to_square in curGroup and not BotHelper.players_in(game, player.team, curGroup, include_opp=False, include_own=True, only_blockable=True):
                 # Test square is inside the cage corner and no player occupies the corner
-                score = RiskBot.BASE_SCORE_CAGE_BALL
                 dist = BotHelper.distance_to_nearest_player(game, player.team, to_square, include_own=False, include_stunned=False, include_opp=True)
                 score += dist_opp_to_ball - dist
-                score += BotHelper.guard_effectiveness_score(player)
                 if dist_opp_to_ball > avg_opp_ma:
                     score -= 30.0
                 if not ball_carrier.state.used:
@@ -1962,30 +2312,32 @@ class BotHelper:
                 if BotHelper.is_bishop_position_of(game, player, ball_carrier):
                     score -= 2
                 score += heat_map.get_cage_necessity_score(to_square)
+                score += 2 * heat_map.units_opponent[to_square.x][to_square.y]  # Prefer squares lots of opponents can get to
+                score -= 5 * heat_map.units_friendly[to_square.x][to_square.y]  # Prefer squares my teammates can't get to
                 if not ball_carrier.state.used:
-                    score = max(0.0, score - RiskBot.BASE_SCORE_CAGE_BALL)  # Penalise forming a cage if ball carrier has yet to move
+                    score = max(0.0, score - GrodBot.BASE_SCORE_CAGE_BALL)  # Penalise forming a cage if ball carrier has yet to move
                 if not player.state.up:
-                    score += RiskBot.ADDITIONAL_SCORE_PRONE
+                    score += 5.0
                 return score, True
 
         return 0, True
 
     @staticmethod
-    def score_mark_opponent(game: g.Game, heat_map: FfHeatMap, player: m.Player, to_square: m.Square) -> Tuple[float, bool]:
+    def score_mark_opponent(game: g.Game, heat_map: FfHeatMap, player: m.Player, to_square: m.Square, bonus_marks: List[Tuple[m.Player, m.Square]]) -> Tuple[float, bool]:
 
         if game.get_opp_team(player.team).state.turn == 8:
             return 0.0, True    # other team has no moves
 
         # Modification - no need to mark prone opponents already marked
         ball_carrier = game.get_ball_carrier()
+        if ball_carrier == player:
+            return 0.0, True  # Don't mark opponents deliberately with the ball
         opp_team = game.get_opp_team(player.team)
         if ball_carrier is not None:
             ball_team = ball_carrier.team
         else:
             ball_team = None
         ball_square = game.get_ball_position()
-        if ball_carrier == player:
-            return 0.0, True  # Don't mark opponents deliberately with the ball
         all_opponents: List[m.Player] = game.get_adjacent_players(to_square, team=opp_team)
         if not all_opponents:
             return 0.0, True
@@ -1998,7 +2350,7 @@ class BotHelper:
             if ball_team == player.team:
                 score += 20.0
             else:
-                score += 30.0
+                score += 35.0
 
         if len(all_opponents) == 1:
             one_die = False
@@ -2010,17 +2362,28 @@ class BotHelper:
                     break
                 elif dice == 1:
                     one_die = True
-            if one_die: # can transform 1d to 2d block
-                score += 10
+            if one_die and not all_opponents[0].has_skill(g.Skill.GUARD): # can transform 1d to 2d block
+                score += 20
             elif game.num_tackle_zones_at(all_opponents[0], all_opponents[0].position) > 0:
                 score -= 5  # less urgent to mark opponents already marked
 
         for opp in all_opponents:
+            if bonus_marks is not None:
+                for assister,forbidden_location in bonus_marks:
+                    if assister == opp and forbidden_location != to_square:
+                        score += 50
+
             if BotHelper.distance_to_scoring_endzone(game, opp.team, to_square) < opp.get_ma() + 2:
                 score += 10.0  # Mark opponents in scoring range first.
                 if BotHelper.is_castle_position_of(to_square, opp.position) and BotHelper.distance_to_scoring_endzone(game, opp.team, to_square) < BotHelper.distance_to_scoring_endzone(game, opp.team, opp.position):
                     score += 10     # better if I'm right in front of them
                 break         # Only add score once.
+            if player.get_st() > opp.get_st():
+                score += 4
+            elif player.get_st() < opp.get_st():
+                score -= 15
+            elif opp.has_skill(g.Skill.BLOCK):
+                score -= 10
 
         if len(all_opponents) == 1:
             score += 20.0
@@ -2043,9 +2406,6 @@ class BotHelper:
             score -= len(all_opponents) * 10.0
         else:
             score += len(all_opponents) * 10.0
-
-        if player.get_st() < 3:
-            score -= 15
 
         ball_is_near = False
         for current_opponent in all_opponents:
@@ -2071,7 +2431,7 @@ class BotHelper:
             distance_ball_carrier_to_end = BotHelper.distance_to_defending_endzone(game, player.team, ball_square)
             distance_square_to_end = BotHelper.distance_to_defending_endzone(game, player.team, to_square)
 
-            if distance_square_to_end + 1.0 < distance_ball_carrier_to_end:
+            if distance_square_to_end + 1.0 <= distance_ball_carrier_to_end:
                 score += 5.0  # Increase score defending on correct side of field - let's not get caught behind the play
 
             # if ball_square is not None:
@@ -2088,55 +2448,77 @@ class BotHelper:
         return 2 * (BotHelper.player_guard_ability(player) - 40)
 
     @staticmethod
-    def score_handoff(game: g.Game, heat_map: FfHeatMap, ball_carrier: m.Player, receiver: m.Player, from_square: m.Square) -> float:
+    def score_handoff(game: g.Game, heat_map: FfHeatMap, ball_carrier: m.Player, receiver: m.Player, from_square: m.Square, variant: bool) -> List[float]:
         if receiver == ball_carrier:
-            return 0.0
+            return [0,0]
 
         num_unmoved = BotHelper.get_num_unmoved(game, ball_carrier.team)
         score = RiskBot.BASE_SCORE_HANDOFF
-        score += BotHelper.turnover_chance_penalty(BotHelper.probability_catch_fail(game, receiver), num_unmoved, False, ball_carrier)
+        prob_fail = BotHelper.probability_catch_fail(game, receiver)
+        score += BotHelper.turnover_chance_penalty(game, prob_fail, num_unmoved, False, receiver.position, ball_carrier, variant)
         if not ball_carrier.team.state.reroll_used:
             score += +10.0
         score -= 5.0 * (BotHelper.distance_to_scoring_endzone(game, ball_carrier.team, receiver.position) - BotHelper.distance_to_scoring_endzone(game, ball_carrier.team, ball_carrier.position))
-        if receiver.state.used:
+        receiver_in_endzone = BotHelper.in_scoring_endzone(game, receiver.team, receiver.position)
+        danger_reduction = heat_map.units_opponent[ball_carrier.position.x][ball_carrier.position.y] - heat_map.units_opponent[receiver.position.x][receiver.position.y]
+        if receiver.state.used and not receiver_in_endzone:
             score -= 30.0
+            score += 15 * danger_reduction
+            if danger_reduction < 0.1:
+                score -= 50
         if (game.num_tackle_zones_in(ball_carrier) > 0 or game.num_tackle_zones_in(receiver) > 0) and not BotHelper.blitz_used(game):
             score -= 50.0  # Don't try a risky hand-off if we haven't blitzed yet
-        if BotHelper.in_scoring_range(game, receiver) and not BotHelper.in_scoring_range(game, ball_carrier):
-            score += 40.0
+        if BotHelper.in_scoring_range(game, receiver):
+            if not BotHelper.in_scoring_range(game, ball_carrier):
+                score += 60 if receiver_in_endzone else 40.0
+        else:
+            if receiver.get_st() < ball_carrier.get_st():
+                score -= 25
         # score += heat_map.get_ball_move_square_safety_score(receiver.position)
-        return score
+        return [score, score + num_unmoved * -RiskBot.BASE_SCORE_TURNOVER_UNMOVED_PLAYER * prob_fail]
 
     @staticmethod
-    def score_pass(game: g.Game, heat_map: FfHeatMap, passer: m.Player, from_square: m.Square, to_square: m.Square) -> float:
+    def score_pass(game: g.Game, heat_map: FfHeatMap, passer: m.Player, from_square: m.Square, to_square: m.Square, variant: bool, current_ball_control: float) -> List[float]:
 
         receiver = game.get_player_at(to_square)
 
         if receiver is None:
-            return 0.0
+            return [0,0]
         if receiver.team != passer.team:
-            return 0.0
+            return [0,0]
         if receiver == passer:
-            return 0.0
+            return [0,0]
 
         num_unmoved = BotHelper.get_num_unmoved(game, passer.team)
-        score = RiskBot.BASE_SCORE_PASS
-        score += BotHelper.turnover_chance_penalty(BotHelper.probability_catch_fail(game, receiver), num_unmoved, False, receiver)
         dist: t.PassDistance = game.get_pass_distance(from_square, receiver.position)
-        score += BotHelper.turnover_chance_penalty(BotHelper.probability_pass_fail(game, passer, from_square, dist), num_unmoved, False, passer)
-        if not passer.team.state.reroll_used:
+        prob_pass_fail = BotHelper.probability_pass_fail(game, passer, from_square, dist)
+        prob_catch_fail = BotHelper.probability_catch_fail(game, receiver)
+        score = RiskBot.BASE_SCORE_PASS
+        score += BotHelper.turnover_chance_penalty(game, prob_pass_fail, num_unmoved, False, passer.position, passer, variant)
+        score += (1-prob_pass_fail) * BotHelper.turnover_chance_penalty(game, prob_catch_fail, num_unmoved, False, receiver.position, receiver, variant)
+        if not passer.team.state.reroll_used or passer.has_skill(g.Skill.PASS):
             score += +10.0
-        score = score - 5.0 * (BotHelper.distance_to_scoring_endzone(game, receiver.team, receiver.position) - BotHelper.distance_to_scoring_endzone(game, passer.team, passer.position))
-        if receiver.state.used:
-            score -= 30.0
+        yardage_gained = BotHelper.distance_to_scoring_endzone(game, passer.team, passer.position) - BotHelper.distance_to_scoring_endzone(game, receiver.team, receiver.position)
+        score += RiskBot.BALL_POSITION_SCORE_PER_SQUARE * yardage_gained
+        receiver_in_endzone = BotHelper.in_scoring_endzone(game, passer.team, to_square)
+        danger_reduction = BotHelper.ball_control_value_at_square(game, heat_map, to_square, passer.team) - current_ball_control
+        score += danger_reduction
+        if receiver.state.used and not receiver_in_endzone:
+            score -= 50 if yardage_gained <= 0 else 30.0
+            if danger_reduction < 2:
+                score -= 50
         if game.num_tackle_zones_in(passer) > 0 or game.num_tackle_zones_in(receiver) > 0 and not BotHelper.blitz_used(game):
             score -= 50.0
-        if BotHelper.in_scoring_range(game, receiver) and not BotHelper.in_scoring_range(game, passer):
-            score += 40.0
-        return score
+        if BotHelper.in_scoring_range(game, receiver):
+            if not BotHelper.in_scoring_range(game, passer):
+                score += 60 if receiver_in_endzone else 40.0
+        else:
+            if receiver.get_st() < passer.get_st():
+                score -= 25
+        return [score, score + num_unmoved * -RiskBot.BASE_SCORE_TURNOVER_UNMOVED_PLAYER * (1 - (1 - prob_pass_fail) * (1 - prob_catch_fail))]
 
     @staticmethod
-    def score_block(game: g.Game, heat_map: FfHeatMap, attacker: m.Player, defender: m.Player) -> float:
+    def score_block(game: g.Game, heat_map: FfHeatMap, attacker: m.Player, defender: m.Player, variant: bool, num_unmoved) -> List[float]:
         score = RiskBot.BASE_SCORE_BLOCK
         ball_carrier = game.get_ball_carrier()
         ball_square = game.get_ball_position()
@@ -2160,34 +2542,36 @@ class BotHelper:
             if num_block_dice == -3:
                 score += -150.0
 
-            if not attacker.team.state.reroll_used and not attacker.has_skill(t.Skill.LONER):
-                score += 10.0
+            if attacker.team.state.reroll_used or attacker.has_skill(t.Skill.LONER):
+                score -= 10.0
             if attacker.has_skill(t.Skill.BLOCK) or attacker.has_skill(t.Skill.WRESTLE):
                 score += 20.0
             if defender.has_skill(t.Skill.DODGE) and not attacker.has_skill(t.Skill.TACKLE):
                 score += -10.0
             if defender.has_skill(t.Skill.BLOCK):
                 score += -10.0
-            if BotHelper.attacker_would_surf(game, attacker, defender):
-                score += 42.0
             if attacker.has_skill(t.Skill.LONER):
                 score -= 10.0
 
+        prob_fail = max(0.0278, .3410 - 0.00369*score)
+        prob_him_down = 0.0000325*score*score + 0.002235*score + 0.1653
+
+        if BotHelper.attacker_would_surf(game, attacker, defender, attacker.position):
+            score += 42.0
         if attacker == ball_carrier:
             score += -45.0
         if defender == ball_carrier:
-            score += 50.0
+            score += RiskBot.BALL_CONTROL_SCORE * prob_him_down
         if (ball_square is not None) and defender.position.is_adjacent(ball_square):
             score += 30.0
-        score += 24.0 - 3 * defender.get_av()
-        score += BotHelper.player_value_thousands(defender) / 3
-        score -= 16.0 + BotHelper.player_value_thousands(attacker) / 10
+        score += BotHelper.fall_down_value(game, defender) * prob_him_down
+        score += BotHelper.turnover_chance_penalty(game, prob_fail, num_unmoved, True, attacker.position if attacker == ball_carrier else None, attacker, variant)
 
-        return score
+        return [score, score + num_unmoved * -RiskBot.BASE_SCORE_TURNOVER_UNMOVED_PLAYER * prob_fail]
 
     @staticmethod
-    def score_push(game: g.Game, from_square: m.Square, to_square: m.Square) -> float:
-        score = 0.0
+    def score_push(game: g.Game, from_square: m.Square, to_square: m.Square, rnd: np.random.RandomState) -> float:
+        score = rnd.rand()
         ball_square = game.get_ball_position()
         if BotHelper.distance_to_sideline(game, to_square) == 0:
             score += 10.0    # Push towards sideline
@@ -2240,15 +2624,15 @@ class BotHelper:
             return True
 
         # If Attacker has the ball, strictly follow up only if there are less opponents next to new square.
-        if game.get_ball_carrier == attacker:
+        if game.get_ball_carrier() == attacker:
             # This isn't working
-            return False
+            #return False
             if len(opp_adj_new) - defender_prone < len(opp_adj_cur) - 1:
                 return True
             else:
                 return False
 
-        if game.get_ball_carrier == defender:
+        if game.get_ball_carrier() == defender:
             return True   # Always follow up if defender has ball
         if BotHelper.distance_to_sideline(game, follow_up_square) == 0:
             return False    # No if moving to sideline
@@ -2272,7 +2656,7 @@ class BotHelper:
         return False
 
     @staticmethod
-    def check_reroll_block(game: g.Game, team: m.Team, block_results: List[ActionSequence], favor: m.Team) -> bool:
+    def check_reroll_block_unused(game: g.Game, team: m.Team, block_results: List[ActionSequence], favor: m.Team) -> bool:
         block_proc: Optional[p.Block] = BotHelper.last_block_proc(game)
         attacker: m.Player = block_proc.attacker
         defender: m.Player = block_proc.defender
@@ -2307,27 +2691,70 @@ class BotHelper:
             return False
 
     @staticmethod
+    def check_reroll_block(game: g.Game, team: m.Team, block_proc: p.Block, favor: m.Team) -> bool:
+        attacker: m.Player = block_proc.attacker
+        defender: m.Player = block_proc.defender
+        is_blitz_action = block_proc.blitz
+        ball_carrier: Optional[m.Player] = game.get_ball_carrier()
+        block_results = block_proc.available_actions()
+
+        best_block_score: float = 0
+        cur_block_score: float = -1
+
+        if len(block_results) > 0:
+            best_block_score = BotHelper.block_favourability(block_results[0].action_type, team, attacker, attacker, defender, favor)
+
+        if len(block_results) > 1:
+            cur_block_score = BotHelper.block_favourability(block_results[1].action_type, team, attacker, attacker, defender, favor)
+            if favor == team and cur_block_score > best_block_score:
+                best_block_score = cur_block_score
+            if favor != team and cur_block_score < best_block_score:
+                best_block_score = cur_block_score
+
+        if len(block_results) > 2:
+            cur_block_score = BotHelper.block_favourability(block_results[2].action_type, team, attacker, attacker, defender, favor)
+            if favor == team and cur_block_score > best_block_score:
+                best_block_score = cur_block_score
+            if favor != team and cur_block_score < best_block_score:
+                best_block_score = cur_block_score
+
+        if best_block_score < 3:
+            return True
+        elif ball_carrier == defender and best_block_score < 5:
+            return True  # Reroll if target has ball and not knocked over.
+        else:
+            return False
+        
+    @staticmethod
     def scoring_urgency_score(game: g.Game, heat_map: FfHeatMap, player: m.Player) -> float:
         if player.team.state.turn == 8:
             return 40
         return 0
 
     @staticmethod
-    def path_cost_to_score(path: pf.Path, num_unmoved, player: m.Player) -> float:
-         return BotHelper.turnover_chance_penalty(1 - path.prob, num_unmoved, True, player)
+    def path_cost_to_score(game: g.Game, path: pf.Path, num_unmoved, drop_ball_square: m.Square, player: m.Player, variant: bool) -> float:
+         return BotHelper.turnover_chance_penalty(game, 1 - path.prob, num_unmoved, True, drop_ball_square, player, variant)
 
     @staticmethod
-    def continuation_path_cost_to_score(path: pf.Path, num_unmoved, player: m.Player) -> float:
-        return BotHelper.path_cost_to_score(path, num_unmoved, player) * 4
-
+    def continuation_path_cost_to_score(game: g.Game, path: pf.Path, num_unmoved, drop_ball_square: m.Square, player: m.Player, variant: bool) -> float:
+        return BotHelper.path_cost_to_score(game, path, num_unmoved, drop_ball_square, player, variant) * 4
 
     @staticmethod
-    def turnover_chance_penalty(probability: float, num_unmoved: int, fall_down: bool, player: m.Player) -> float:
+    def turnover_chance_penalty(game: g.Game, probability: float, num_unmoved: int, fall_down: bool, drop_ball_square: m.Square, player: m.Player, variant: bool) -> float:
         score = RiskBot.BASE_SCORE_TURNOVER + num_unmoved * RiskBot.BASE_SCORE_TURNOVER_UNMOVED_PLAYER
         if fall_down:
-            score -= BotHelper.fall_down_value(player)
+            score -= BotHelper.fall_down_value(game, player)
+        if drop_ball_square is not None:
+            score += BotHelper.drop_ball_penalty(game, drop_ball_square, player)
         return score * probability
 
+    @staticmethod
+    def drop_ball_penalty(game: g.Game, drop_ball_square: m.Square, player: m.Player) -> float:
+        my_players = len(game.get_adjacent_players(drop_ball_square, team=player.team, down=False))
+        their_players = len(game.get_adjacent_players(drop_ball_square, team=game.get_opp_team(player.team), down=False))
+        favorability = my_players - their_players
+        return min(0, 50 * (favorability-2))
+    
     @staticmethod
     def probability_break_armor(player: m.Player, modifiers: int) -> float:
         check = player.get_av() - modifiers
@@ -2336,12 +2763,12 @@ class BotHelper:
         return (-0.5 * check * check + 0.5 * check + 36.0) / 36.0
 
     @staticmethod
-    def fall_down_value(player: m.Player) -> float:
-        return BotHelper.probability_break_armor(player, 0) * BotHelper.player_value_thousands(player) * 5.2
+    def fall_down_value(game: g.Game, player: m.Player) -> float:
+        return BotHelper.probability_break_armor(player, 0) * BotHelper.discounted_player_value(game, player) * 7.5
 
     @staticmethod
     def get_num_unmoved(game: g.Game, my_team: g.Team) -> int:
-        return len(BotHelper.get_players(game, my_team, include_own=True, include_opp=False, include_used=False))
+        return len(BotHelper.get_players(game, my_team, include_own=True, include_opp=False, include_used=False)) - 1
 
     @staticmethod
     def probability_catch_fail(game: g.Game, receiver: m.Player) -> float:
@@ -2425,7 +2852,7 @@ class BotHelper:
     @staticmethod
     def player_bash_ability(game: g.Game, player: m.Player) -> float:
         bashiness: float = 0.0
-        bashiness += 10.0 * player.get_st()
+        bashiness += 12.0 * player.get_st()
         bashiness += 5.0 * player.get_av()
         if player.has_skill(t.Skill.BLOCK):
             bashiness += 10.0
@@ -2527,7 +2954,7 @@ class BotHelper:
     @staticmethod
     def player_blitz_ability(game: g.Game, player: m.Player) -> float:
         blitzing_ability = BotHelper.player_bash_ability(game, player)
-        blitzing_ability += player.get_ma() * 10.0
+        blitzing_ability += player.get_ma() * 8.0
         if player.has_skill(t.Skill.TACKLE):
             blitzing_ability += 5.0
         if player.has_skill(t.Skill.SPRINT):
@@ -2628,8 +3055,15 @@ class BotHelper:
         return running_ability
 
     @staticmethod
-    def player_value_thousands(player: m.Player) -> float:
+    def discounted_player_value(game: g.Game, player: m.Player) -> float:
         value = player.role.cost / 1000 + player.has_skill(t.Skill.BLOCK)*10
+
+        # scale to time value, giving an upgrade to low armor still being on the field
+        fraction_of_game_remaining = (25.0 - player.team.state.turn - 8 * game.state.half) / 16.0
+        quadratic_coef = -1.95 + 0.191 * player.get_av()
+        linear_coef = 1.0 - quadratic_coef
+        value *= quadratic_coef * fraction_of_game_remaining * fraction_of_game_remaining + linear_coef * fraction_of_game_remaining
+
         return value
 
     @staticmethod
@@ -2637,6 +3071,7 @@ class BotHelper:
         type_1 = (len(action.action_steps) == 2) and (action.action_steps[0].action_type == t.ActionType.START_MOVE) and (action.action_steps[1].action_type == t.ActionType.END_PLAYER_TURN)
         type_2 = (len(action.action_steps) == 1) and (action.action_steps[0].action_type == t.ActionType.START_MOVE)
         return type_1 or type_2
+
 
 
 # Register bot
@@ -2652,29 +3087,30 @@ def main():
     # config = get_config("gym-3.json")
     ruleset = botbowl.load_rule_set(config.ruleset, all_rules=False)  # We don't need all the rules
     arena = botbowl.load_arena(config.arena)
-    home = botbowl.load_team_by_filename("human", ruleset)
-    away = botbowl.load_team_by_filename("human", ruleset)
 
-    num_games: int = 10
-    home_games: int = num_games / 2
+    num_games: int = 99999
     wins = 0
     ties = 0
     td_delta = 0
     # Play 10 games
     for i in range(num_games):
-        i_am_home = i < home_games
+        i_am_home = i % 2 == 0
         if i_am_home:
             home_agent: RiskBot = botbowl.make_bot('riskbot')
             home_agent.name = "riskBot"
             home_agent.variant = True
             away_agent = botbowl.make_bot('riskbot')
             away_agent.name = "riskbot"
+            home = botbowl.load_team_by_filename("human2", ruleset)
+            away = botbowl.load_team_by_filename("human", ruleset)
         else:
             home_agent = botbowl.make_bot('riskbot')
             home_agent.name = "riskbot"
             away_agent: RiskBot = botbowl.make_bot('riskbot')
             away_agent.name = "riskbot"
             away_agent.variant = True
+            home = botbowl.load_team_by_filename("human", ruleset)
+            away = botbowl.load_team_by_filename("human2", ruleset)
         config.debug_mode = False
         game = botbowl.Game(i, home, away, home_agent, away_agent, config, arena=arena, ruleset=ruleset)
         game.config.fast_mode = True

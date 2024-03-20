@@ -139,8 +139,9 @@ class ActionNode(Node):
             print(f"{t}<ActionNode p='{min_max}' visits='{self.num_visits()}' score='{self.score():.6f}' actions='{len(self.available_actions)}'/>")
         else:
             print(f"{t}<ActionNode p='{min_max}' visits='{self.num_visits()}' score='{self.score():.6f}' actions='{len(self.available_actions)}'>")
-            for child in sorted(self.children, key=lambda c: -c.score()):
-                child.print(tabs+1)
+            if tabs <= 1:
+                for child in sorted(self.children, key=lambda c: -c.score()):
+                    child.print(tabs+1)
         if len(self.children) > 0:
             print(f'{t}</ActionNode>')
 
@@ -215,7 +216,7 @@ class MCTS:
             score = self.heuristic(self.game, self.agent)
             self._backpropagate(tree_trajectory, score)
             self.game.revert(step)
-            # root.print()
+     #   root.print()
         return root
 
     def _backpropagate(self, trajectory, score):

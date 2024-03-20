@@ -19,7 +19,7 @@
     "offensive_formations": ["off_wedge.txt", "off_line.txt"],
     "time_limits": {
         "game": 15360,
-        "turn": 240,
+        "turn": 999999,
         "secondary": 20,
         "disqualification": 1000,
         "init": 10,

@@ -34,7 +34,7 @@ game_modes = {
 }
 
 
-def new_game(away_team_name, home_team_name, away_agent=None, home_agent=None, game_mode='standard'):
+def new_game(away_team_name, home_team_name, away_agent=None, home_agent=None, game_mode='standard', seed=None):
     assert away_agent is not None
     assert home_agent is not None
     config_name = game_modes[game_mode]
@@ -43,7 +43,7 @@ def new_game(away_team_name, home_team_name, away_agent=None, home_agent=None, g
     home = load_team_by_name(home_team_name, ruleset, board_size=board_size)
     away = load_team_by_name(away_team_name, ruleset, board_size=board_size)
     game_id = str(uuid.uuid1())
-    game = Game(game_id, home, away, home_agent, away_agent, config, record=False)
+    game = Game(game_id, home, away, home_agent, away_agent, config, record=False, seed=seed)
     game.init()
     host.add_game(game)
     print("Game created with id ", game.game_id)

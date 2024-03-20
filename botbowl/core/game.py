@@ -13,7 +13,7 @@ from botbowl.core.procedure import *
 from botbowl.core.forward_model import Trajectory, MovementStep, Step
 from copy import deepcopy
 from typing import Optional, Tuple, List, Union, Any
-
+import botbowl.core.pathfinding as pf
 
 class InvalidActionError(Exception):
     pass
@@ -37,6 +37,8 @@ class Game:
     action: Optional[Action]
     trajectory: Trajectory
     square_shortcut: List[List[Square]]
+    msg: str
+    save_statistics = True
 
     def __init__(self, game_id: str, home_team: Team, away_team: Team, home_agent: Agent, away_agent: Agent,
                  config: Configuration,
@@ -64,6 +66,7 @@ class Game:
         self.action = None
         self.trajectory = Trajectory()
         self.square_shortcut = self.state.pitch.squares
+        self.msg = ""
 
     def to_json(self, ignore_reports: bool = False):
         return {
@@ -286,6 +289,15 @@ class Game:
         """
         End the game
         """
+
+        # write stat info to file
+        if self.save_statistics:
+            file = open("stat_file.txt","a")
+            self.msg += "Final," + str(self.get_agent_team(self.home_agent).state.score - self.get_agent_team(self.away_agent).state.score) + "\n"
+            file.write(self.msg)
+            self.msg = ""
+            file.close
+
         # Game ended when the last action was received - to avoid timout during finishing procedures
         self.end_time = self.last_action_time
 
@@ -343,11 +355,128 @@ class Game:
                 return True
         return False
 
+    @staticmethod
+    def pv(player: Player) -> int:
+        return player.role.cost / 1000 + (10 if player.has_skill(Skill.BLOCK) else 0)
+
+    @staticmethod
+    def max_heat_around_position(self, heat_map, square: Square, opponent: bool) -> float:
+        highest = 0.0
+        for square in self.get_adjacent_squares(square):
+            heat: float = heat_map.units_opponent[square.x][square.y] if opponent else heat_map.units_friendly[square.x][square.y]
+            highest = max(highest, heat)
+        return highest
+    
+    def get_players(self, team: Team, include_own: bool = True, include_opp: bool = True, include_stunned: bool = True, include_used: bool = True, include_off_pitch: bool = False, only_blockable: bool = False, only_used: bool = False) -> List[Player]:
+        players: List[Player] = []
+        selected_players: List[Player] = []
+        for iteam in self.state.teams:
+            if iteam == team and include_own:
+                players.extend(iteam.players)
+            if iteam != team and include_opp:
+                players.extend(iteam.players)
+        for player in players:
+            if only_blockable and not player.state.up:
+                continue
+            if only_used and not player.state.used:
+                continue
+
+            if include_stunned or not player.state.stunned:
+                if include_used or not player.state.used:
+                    if include_off_pitch or (player.position is not None and not self.is_out_of_bounds(player.position)):
+                        selected_players.append(player)
+
+        return selected_players
+
+    def team_statistics_txt(self, team: Team, heat_map, ball_position: Square):
+            self.msg += str(team.state.rerolls) + "," + str(0 if team.state.reroll_used else 1) + "," + str(team.state.bribes) + ","
+            self.msg += str(team.state.score) + "," + str(team.state.turn) + "," + str(1 if self.state.half == 1 and self.state.kicking_first_half == team else 0) + ","
+            if self.get_agent_team(self.home_agent) == team:
+                self.msg += str(heat_map.units_friendly[ball_position.x][ball_position.y]) + "," + str(self.max_heat_around_position(self, heat_map, ball_position, False)) + ","
+            else:
+                self.msg += str(heat_map.units_opponent[ball_position.x][ball_position.y]) + "," + str(self.max_heat_around_position(self, heat_map, ball_position, True)) + ","
+            self.msg += str(1 if team == self.active_team and self.is_blitz_available() else 0) + ","
+            self.msg += str(1 if self.get_ball_carrier() is not None and self.get_ball_carrier().team == team and not self.get_ball_carrier().state.used else 0) + ","
+            value_up = 0
+            value_down = 0
+            value_down_used = 0
+            value_used = 0
+            value_reserve = 0
+            value_ko = 0
+            for player in self.get_players(team=team, include_opp=False, include_off_pitch=True):
+                if player in self.get_players_on_pitch(team):
+                    if player.state.up:
+                        if player.state.used:
+                            value_used += self.pv(player)
+                        else:
+                            value_up += self.pv(player)
+                    else:
+                        if player.state.used or player.state.stunned:
+                            value_down_used += self.pv(player)
+                        else:
+                            value_down += self.pv(player)                      
+                elif player.state.knocked_out:
+                    value_ko += self.pv(player)
+                elif player in self.get_reserves(player.team):
+                    value_reserve += self.pv(player)
+            self.msg += str(value_up) + "," + str(value_down) + "," + str(value_down_used) + "," + str(value_used) + "," + str(value_reserve) + "," + str(value_ko) + ","
+
+    def reverse_x_for_right(self, team: Team, x: int) -> int:
+        if not self.is_team_side(Square(13, 3), team):
+            res = self.state.pitch.width - 1 - x
+        else:
+            res = x
+        return res
+
+
     def _safe_act(self) -> Optional[Action]:
         """
         Gets action from agent and sets correct player reference.
         """
         assert self.actor is not None
+
+        # save evaluation info to file
+        if self.save_statistics:
+            import botbowl.core.pathfinding as pf
+            proc = self.get_procedure()
+            if isinstance(proc, botbowl.core.procedure.Turn) and not proc.quick_snap:
+                home_team = self.get_agent_team(self.home_agent)
+                players_to_move: List[Player] = self.get_players(home_team, include_own=True, include_opp=False, include_used=False)
+                paths_own: Dict[Player, List[pf.Path]] = dict()
+                for player in players_to_move:
+                    paths = pf.get_all_paths(self, player, from_position=None, blitz=True)
+                    paths_own[player] = paths
+
+                players_opponent: List[Player] = self.get_players(home_team, include_own=False, include_opp=True, include_stunned=False)
+                paths_opposition: Dict[Player, List[pf.Path]] = dict()
+                for player in players_opponent:
+                    paths = pf.get_all_paths(self, player, from_position=None, blitz=True)
+                    paths_opposition[player] = paths
+
+                # Create a heat-map of control zones
+                heat_map: FfHeatMap = FfHeatMap(self, home_team)
+                heat_map.add_unit_by_paths(self, paths_opposition)
+                heat_map.add_unit_by_paths(self, paths_own)
+                heat_map.add_players_moved(self, self.get_players(home_team, include_own=True, include_opp=False, only_used=True))
+                for player in players_to_move:
+                    heat_map.units_friendly[player.position.x][player.position.y] += 1
+                for player in players_opponent:
+                    heat_map.units_opponent[player.position.x][player.position.y] += 1
+
+                ball_position = self.get_ball().position
+                ball_carrier_int = 0
+                ball_carrier = self.get_ball_carrier()
+                if ball_carrier is not None:
+                    ball_carrier_int = 1 if ball_carrier.team == home_team else -1
+                self.msg += str(ball_carrier_int) + "," + str(self.state.half) + ","
+                self.msg += str(self.reverse_x_for_right(home_team, ball_position.x)) + ","
+                self.msg += str(1 if self.active_team == home_team else -1) + ","
+                self.team_statistics_txt(home_team, heat_map, ball_position)
+                self.team_statistics_txt(self.get_opp_team(home_team), heat_map, ball_position)
+                self.msg += "\n"
+            
+
+
         action = self.actor.act(self)
         if not type(action) == Action:
             return None
@@ -2648,6 +2777,39 @@ class Game:
         if player.has_skill(Skill.TIMMMBER):
             return len([p for p in self.get_adjacent_teammates(player, down=False) if self.num_tackle_zones_in(p) == 0])
         return 0
+
+class FfHeatMap:
+    """ A heat map of a Blood Bowl field.
+
+    A class for analysing zones of control for both teams
+    """
+
+    def __init__(self, game: Game, team: Team):
+        self.game = game
+        self.team = team
+        # Note that the edges are not on the field, but represent crowd squares
+        self.units_friendly: List[List[float]] = [[0.0 for y in range(game.state.pitch.height)] for x in range(game.state.pitch.width)]
+        self.units_opponent: List[List[float]] = [[0.0 for y in range(game.state.pitch.height)] for x in range(game.state.pitch.width)]
+
+    def add_unit_paths(self, player: Player, paths: List[pf.Path]):
+        is_friendly: bool = player.team == self.team
+
+        for path in paths:
+            if is_friendly:
+                self.units_friendly[path.get_last_step().x][path.get_last_step().y] += path.prob * path.prob
+            else:
+                self.units_opponent[path.get_last_step().x][path.get_last_step().y] += path.prob * path.prob
+
+    def add_unit_by_paths(self, game: Game, paths: Dict[Player, List[pf.Path]]):
+        for player in paths.keys():
+            self.add_unit_paths(player, paths[player])
+
+    def add_players_moved(self, game: Game, players: List[Player]):
+        for player in players:
+            adjacents: List[Square] = game.get_adjacent_squares(player.position, occupied=True)
+            self.units_friendly[player.position.x][player.position.y] += 1.0
+            for adjacent in adjacents:
+                self.units_friendly[player.position.x][player.position.y] += 0.5
 
 
 _directions = [(1, 1),
